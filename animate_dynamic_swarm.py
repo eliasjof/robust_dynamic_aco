@@ -87,42 +87,87 @@ def render(path, k, edges, positions, stations, vertices, soc, problem,
            result, previous, jitter, k_reachable, label_mode="all", label_fontsize=4.8):
     fig, ax = plt.subplots(figsize=(8, 7))
     cmap = plt.get_cmap('tab10')
-    colors = {sid: cmap(j % 10) for j, sid in enumerate(problem.station_ids)}
-    active_dev, psi = robust_contributions(problem, result)
+    
+    station_ids = list(stations.keys())
+    colors = {sid: cmap(j % 10) for j, sid in enumerate(station_ids)}
+    
+    # 1. Desenha a malha e os obstáculos
     for u, v, _ in edges:
-        ax.plot([positions[u][0], positions[v][0]],
-                [positions[u][1], positions[v][1]], color='#dddddd', lw=.45, zorder=1)
-    changed = {r for r, s in result.assignment.items() if previous and previous.get(r) != s}
-    if label_mode == "all": labelled = set(problem.robot_ids)
-    elif label_mode == "critical": labelled = {rid for i,rid in enumerate(problem.robot_ids) if psi[i] > 0 or rid in changed or soc[i] <= .25}
-    else: labelled = set()
-    for i, rid in enumerate(problem.robot_ids):
-        x, y = positions[vertices[rid]]; dx, dy = jitter[rid]; sid = result.assignment[rid]
-        ax.scatter(x+dx, y+dy, s=18+75*soc[i], color=colors[sid], alpha=.82,
-                   edgecolor='red' if rid in changed else 'black',
-                   linewidth=1.4 if rid in changed else .25, zorder=4)
-        if rid in labelled:
-            ax.annotate(f"{rid}  SoC={100*soc[i]:.0f}%\n"
-                        f"d={active_dev[i]:.2f}  psi={psi[i]:.2f}",
-                        xy=(x+dx,y+dy), xytext=(4,5), textcoords='offset points',
-                        fontsize=label_fontsize, zorder=8, clip_on=False,
-                        bbox=dict(facecolor='white', edgecolor='none', alpha=.70, pad=.6))
-    assigned = Counter(result.assignment.values())
+        ax.plot([positions[u][0], positions[v][0]], [positions[u][1], positions[v][1]], color='#dddddd', lw=0.45, zorder=1)
+        
+    for ox, oy in obstacle_coords:
+        ax.add_patch(plt.Rectangle((ox - 0.5, oy - 0.5), 1, 1, color='#dddddd', zorder=2))
+        
+    # 2. Calcula as métricas robustas (psi, active_dev) para os robôs no otimizador
+    active_dev = {}
+    psi = {}
+    changed = set()
+    if problem and result:
+        dev_array, psi_array = robust_contributions(problem, result)
+        for i, rid in enumerate(problem.robot_ids):
+            active_dev[rid] = dev_array[i]
+            psi[rid] = psi_array[i]
+        changed = {r for r, s in result.assignment.items() if previous and previous.get(r) != s}
+        
+    # 3. Desenha TODOS os robôs da Máquina de Estados
+    for rid, coords in xy.items():
+        x, y = coords
+        robot_soc = soc[rid]
+        robot_state = state[rid]
+        
+        # CONTROLO DE TAMANHO E COR AQUI
+        if robot_state == 0:  # WORKING
+            color = '#999999'
+            edgecolor = '#666666'
+            linewidth = 0.5
+            marker_size = 20  # <--- ROBÔ A TRABALHAR: PEQUENO
+        else:
+            sid = result.assignment.get(rid) if result else None
+            color = colors[sid] if sid else '#ff0000'
+            edgecolor = 'red' if rid in changed else 'black'
+            linewidth = 1.4 if rid in changed else 0.25
+            marker_size = 120 # <--- ROBÔ EM FILA/RECARGA: GRANDE E EM DESTAQUE
+            
+        ax.scatter(x, y, s=marker_size, color=color, alpha=0.82, edgecolor=edgecolor, linewidth=linewidth, zorder=4)
+        
+        # 4. Rótulos avançados apenas para quem está a carregar ou a caminho
+        if robot_state != 0 and result:
+            d_val = active_dev.get(rid, 0.0)
+            p_val = psi.get(rid, 0.0)
+            status_marker = "⚡" if robot_state == 3 else "" # PLUGGED_IN
+            
+            ax.annotate(
+                f"{rid} {status_marker} SoC={100*robot_soc:.0f}%\n"
+                f"d={d_val:.2f}  psi={p_val:.2f}",
+                (x, y), xytext=(4,5), textcoords='offset points',
+                fontsize=label_fontsize, zorder=8, clip_on=False,
+                bbox=dict(facecolor='white', edgecolor='none', alpha=0.70, pad=0.6)
+            )
+            
+    # 5. Desenha as Estações
+    assigned_counts = Counter(result.assignment.values()) if result else Counter()
     for j, (sid, v) in enumerate(stations.items()):
-        x, y = positions[v]; total = int(problem.current_load[j] + assigned[sid])
-        ax.scatter(x,y,s=220,marker='s',color=colors[sid],edgecolor='black',zorder=7)
-        ax.text(x,y+.35,f"{sid}\n{total}/{int(problem.total_capacity[j])}",
-                fontsize=7,ha='center',fontweight='bold',color=colors[sid])
-    ax.set_title(f"Dynamic robust allocation, decision epoch $t_{{{k}}}$", fontweight='bold')
-    ax.text(.01,.01,f"fitness={result.fitness:.2f} | robust={result.components['robust']:.2f} | "
-            f"congestion={result.components['congestion']:.2f} | "
-            f"switches={int(result.components['switch_count'])} | k={k_reachable}",
-            transform=ax.transAxes,fontsize=7.3,
-            bbox=dict(facecolor='white',edgecolor='#aaaaaa',boxstyle='round,pad=.2'))
-    ax.text(.99,.01,r"d: active deviation; psi: contribution to $\Psi(X,\Gamma)$",
-            transform=ax.transAxes,fontsize=6.2,ha='right')
-    ax.set_aspect('equal'); ax.axis('off'); fig.tight_layout()
-    fig.savefig(path,dpi=160,bbox_inches='tight'); plt.close(fig)
+        x, y = positions[v]
+        ax.scatter(x, y, s=220, marker='s', color=colors[sid], edgecolor='black', zorder=7)
+        cap = problem.total_capacity[j] if problem else "N/A"
+        total = assigned_counts[sid]
+        ax.text(x, y + 0.35, f"{sid}\n{total}/{cap}", fontsize=7, ha='center', fontweight='bold', color=colors[sid])
+        
+    ax.set_title(f"Dynamic FSM Swarm Logistics: $t_{{{epoch}}}$ + {phase:.2f}", fontweight='bold')
+    
+    if result:
+        metrics_text = (
+            f"fitness={result.fitness:.2f} | robust={result.components['robust']:.2f} | "
+            f"congestion={result.components['congestion']:.2f} | switches={int(result.components['switch_count'])}"
+        )
+        ax.text(0.01, 0.01, metrics_text, transform=ax.transAxes, fontsize=7.3, bbox=dict(facecolor='white', edgecolor='#aaaaaa', boxstyle='round,pad=0.2'))
+        ax.text(0.99, 0.01, r"d: active dev; psi: contrib to $\Psi(X,\Gamma)$", transform=ax.transAxes, fontsize=6.2, ha='right')
+        
+    ax.set_aspect('equal')
+    ax.axis('off')
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches='tight')
+    plt.close(fig)
 
 
 def find_ffmpeg(requested='ffmpeg'):

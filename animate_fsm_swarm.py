@@ -1,7 +1,7 @@
 """
 Animação de Enxame Robótico com Máquina de Estados Finita (FSM).
-Inclui obstáculos estáticos impenetráveis, navegação em 8 direções (sem cortar quinas),
-e busca de caminho A* no estado de trabalho para evitar colisões visuais.
+Inclui obstáculos estáticos impenetráveis e desvio dinâmico de colisões (Prioritized Planning),
+onde robôs de menor índice têm prioridade de passagem sobre robôs de maior índice.
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
     rng = np.random.default_rng(seed)
     is_obstacle = rng.random((rows, cols)) < obstacle_prob
     
-    # 1. Definição das posições
     pos = {}
     for r in range(rows):
         for c in range(cols):
@@ -48,7 +47,6 @@ def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
                 v = r * cols + c
                 pos[v] = (c, r)
 
-    # 2. Criação das arestas (retas: peso 1.0, diagonais: peso 1.414)
     raw_graph = {v: [] for v in pos}
     directions = [
         (0, 1, 1.0), (1, 0, 1.0), (0, -1, 1.0), (-1, 0, 1.0),
@@ -71,7 +69,7 @@ def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
                     nv = nr * cols + nc
                     raw_graph[v].append((nv, w))
 
-    # 3. Extrair o Maior Componente Conexo (evita nós ilhados)
+    # Extrair o Maior Componente Conexo
     visited = set()
     largest_cc = set()
     for node in raw_graph:
@@ -87,26 +85,20 @@ def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
             if len(cc) > len(largest_cc):
                 largest_cc = cc
 
-    # 4. Construir o grafo final limpo
     graph = {v: [edge for edge in raw_graph[v] if edge[0] in largest_cc] for v in largest_cc}
     final_pos = {v: pos[v] for v in largest_cc}
     
     edges = []
     for v in graph:
         for nv, w in graph[v]:
-            if v < nv:  # Evita duplicados visuais
+            if v < nv:
                 edges.append((v, nv, w))
                 
-    # Lista de coordenadas dos obstáculos para a renderização
     obstacle_coords = [(c, r) for r in range(rows) for c in range(cols) if is_obstacle[r, c]]
-
     return graph, edges, final_pos, obstacle_coords
 
 
 def build_cache_dijkstra(graph, stations_dict):
-    """
-    Constrói a cache de distâncias usando o algoritmo de Dijkstra com pesos reais.
-    """
     cache = {}
     for sid, start_v in stations_dict.items():
         dist = {v: float('inf') for v in graph}
@@ -125,12 +117,10 @@ def build_cache_dijkstra(graph, stations_dict):
                     
         for v, d in dist.items():
             cache[(v, sid)] = d
-            
     return cache
 
 
 def make_cost_matrix_local(vertices_dict, station_ids, cache):
-    """Monta a matriz de custos a partir da cache."""
     c_subset = np.zeros((len(vertices_dict), len(station_ids)))
     for i, (rid, v) in enumerate(vertices_dict.items()):
         for j, sid in enumerate(station_ids):
@@ -139,7 +129,6 @@ def make_cost_matrix_local(vertices_dict, station_ids, cache):
 
 
 def ensure_k_station_reachability_local(c_subset, d_subset, proposed_L, k, slack=0.50):
-    """Garante margem de segurança de bateria no modelo robusto."""
     L = proposed_L.copy()
     req = c_subset + d_subset
     for i in range(len(L)):
@@ -153,7 +142,6 @@ def ensure_k_station_reachability_local(c_subset, d_subset, proposed_L, k, slack
 # ============================================================================
 
 def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, caps, load, previous, min_reachable, chargers_per_station, gamma_frac=0.25):
-    """Constrói a instância de otimização D-ACO apenas para robôs que precisam de carga."""
     if not active_rids:
         return None, 0
 
@@ -193,10 +181,9 @@ def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, 
     raise RuntimeError("O subconjunto de robôs não possui rotas viáveis. Tente aumentar a margem de capacidade.")
 
 
-def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng, working_targets, pos):
+def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng, working_targets, pos, dynamic_obstacles):
     """
-    Calcula o próximo nó para o robô.
-    No modo WORKING utiliza o algoritmo A* para desviar ativamente dos obstáculos estáticos.
+    Calcula o próximo nó, ignorando ativamente os obstáculos dinâmicos (outros robôs).
     """
     if state[rid] in (WAITING, PLUGGED_IN):
         return current_v
@@ -206,11 +193,10 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
         if current_v == target_v:
             return current_v
             
-        # Algoritmo A* (A-Star) para garantir que o robô contorna os obstáculos com perfeição
+        # Busca Dinâmica com A* ignorando obstáculos dinâmicos (Prioritized Planning)
         pq = [(0.0, current_v)]
         came_from = {current_v: None}
         g_score = {current_v: 0.0}
-        
         tx, ty = pos[target_v]
         
         while pq:
@@ -218,6 +204,10 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
             if curr == target_v:
                 break
             for nxt, weight in graph[curr]:
+                # DESVIO DINÂMICO: Se a célula está ocupada por um robô de maior prioridade, ignora
+                if nxt in dynamic_obstacles:
+                    continue
+                    
                 new_g = g_score[curr] + weight
                 if nxt not in g_score or new_g < g_score[nxt]:
                     g_score[nxt] = new_g
@@ -226,10 +216,9 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
                     heapq.heappush(pq, (new_g + heuristic, nxt))
                     came_from[nxt] = curr
                     
-        # Reconstruir o caminho até ao próximo passo
         step = target_v
         if step not in came_from:
-            return current_v
+            return current_v  # Sem rota livre atual? Fica parado à espera.
         while came_from[step] != current_v:
             step = came_from[step]
             
@@ -240,13 +229,17 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
         if sid is None:
             return current_v
             
-        neighbors = [u for u, _ in graph[current_v]]
-        best_neighbor = min(neighbors, key=lambda n: cache.get((n, sid), float('inf')))
+        # DESVIO DINÂMICO: Filtra vizinhos ocupados
+        valid_neighbors = [u for u, _ in graph[current_v] if u not in dynamic_obstacles]
+        
+        if not valid_neighbors:
+            return current_v  # Trânsito bloqueado à frente, fica parado
+            
+        best_neighbor = min(valid_neighbors, key=lambda n: cache.get((n, sid), float('inf')))
         return best_neighbor
 
 
 def interpolate_positions(vertices, target, positions, fraction, jitter):
-    """Calcula as coordenadas suaves (sub-grid) do robô para as animações."""
     out = {}
     for rid, u in vertices.items():
         v = target[rid]
@@ -261,18 +254,15 @@ def interpolate_positions(vertices, target, positions, fraction, jitter):
 
 
 def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, xy, soc, state, problem, result, previous, working_targets, label_fontsize=4.6):
-    """Renderiza uma moldura do enxame."""
     fig, ax = plt.subplots(figsize=(8, 7))
     cmap = plt.get_cmap('tab10')
     
     station_ids = list(stations.keys())
     colors = {sid: cmap(j % 10) for j, sid in enumerate(station_ids)}
     
-    # 1. Desenha a malha de navegação (arestas)
     for u, v, _ in edges:
         ax.plot([positions[u][0], positions[v][0]], [positions[u][1], positions[v][1]], color='#eeeeee', lw=0.6, zorder=1)
         
-    # 2. Desenha os blocos dos obstáculos estáticos
     for ox, oy in obstacle_coords:
         ax.add_patch(plt.Rectangle((ox - 0.5, oy - 0.5), 1, 1, color='#dddddd', zorder=2))
         
@@ -280,7 +270,6 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
     if result and problem:
         changed = {r for r, s in result.assignment.items() if previous and previous.get(r) != s}
         
-    # 3. Desenha os robôs
     for rid, coords in xy.items():
         x, y = coords
         robot_soc = soc[rid]
@@ -306,7 +295,6 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
             bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=0.3)
         )
             
-    # 4. Desenha as Estações de Recarga
     assigned_counts = Counter(result.assignment.values()) if result else Counter()
     for j, (sid, v) in enumerate(stations.items()):
         x, y = positions[v]
@@ -317,7 +305,7 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
             ha='center', fontsize=7, fontweight='bold', color=colors[sid]
         )
         
-    ax.set_title(f'FSM Swarm Logistics (Obstacles & Diagonals): $t_{{{epoch}}}$ + {phase:.2f}', fontweight='bold')
+    ax.set_title(f'FSM Swarm: Dynamic Obstacle Avoidance $t_{{{epoch}}}$ + {phase:.2f}', fontweight='bold')
     
     if result:
         metrics_text = f"Active D-ACO Agents: {len(problem.robot_ids)} | Switches: {int(result.components['switch_count'])}"
@@ -332,7 +320,6 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
 
 def main():
     p = argparse.ArgumentParser()
-    # Padrões menores para facilitar a visualização
     p.add_argument('--robots', type=int, default=15)
     p.add_argument('--stations', type=int, default=3)
     p.add_argument('--rows', type=int, default=8)
@@ -360,7 +347,6 @@ def main():
     
     rng = np.random.default_rng(a.seed)
     
-    # Geração Segura do Mapa
     graph, edges, pos, obstacle_coords = create_custom_grid_graph(a.rows, a.cols, a.obstacle_prob, a.seed)
     graph_nodes = list(graph.keys())
     
@@ -371,11 +357,18 @@ def main():
     cache = build_cache_dijkstra(graph, stations)
     
     robot_node_pool = [n for n in graph_nodes if n not in station_nodes]
+    
+    # --- TRAVA DE SEGURANÇA: AJUSTA O NÚMERO DE ROBÔS AO TAMANHO DO MAPA 40% de células livres ---
+    if a.robots > int(len(robot_node_pool)*0.60):
+        print(f"\n⚠️ AVISO: O mapa gerado só tem {len(robot_node_pool)} células livres iniciais.")
+        print(f"Reduzindo automaticamente a frota de {a.robots} para {int(len(robot_node_pool)*0.60)} robôs.\n")
+        a.robots = int(len(robot_node_pool)*0.60)
+    # -----------------------------------------------------------------------
+        
     robot_start_nodes = rng.choice(robot_node_pool, size=a.robots, replace=False)
     robot_ids = [f'R{i:02d}' for i in range(a.robots)]
     vertices = {rid: v for rid, v in zip(robot_ids, robot_start_nodes)}
     
-    # FSM e Waypoints
     soc = {r: rng.uniform(0.35, 1.0) for r in robot_ids}
     state = {r: WORKING for r in robot_ids}
     working_targets = {r: int(rng.choice(graph_nodes)) for r in robot_ids}
@@ -447,13 +440,18 @@ def main():
             result = model.solve(problem, seed=a.seed + k)
             previous_assignment = dict(result.assignment)
             
-        # 5. Interpolação de Movimento
+        # 5. PLANEAMENTO PRIORIZADO (Prevenção de Colisões Dinâmicas)
         target = {}
-        for r in robot_ids:
+        dynamic_obstacles = set()
+        
+        # A ordenação pelo ID (R00, R01, R02...) garante a prioridade
+        for r in sorted(robot_ids):
             target[r] = get_next_step(
                 r, vertices[r], state, previous_assignment,
-                graph, cache, stations, rng, working_targets, pos
+                graph, cache, stations, rng, working_targets, pos, dynamic_obstacles
             )
+            # A posição que o robô ocupar será tratada como parede pelos robôs seguintes
+            dynamic_obstacles.add(target[r])
             
         for sub in range(a.frames_per_epoch):
             fraction = sub / a.frames_per_epoch
@@ -471,7 +469,6 @@ def main():
         
     print(f'Geração concluída. Guardados {len(paths)} frames em {out}')
 
-    # Fecho dos Videos
     images = [Image.open(x).convert('RGB') for x in paths]
     duration = int(round(1000 / a.fps))
     images[0].save(out / 'fsm_swarm_animation.gif', save_all=True, append_images=images[1:], duration=duration, loop=0, optimize=False)
