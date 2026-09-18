@@ -1,7 +1,10 @@
 """
 Animação de Enxame Robótico com Máquina de Estados Finita (FSM).
-Inclui obstáculos estáticos impenetráveis e desvio dinâmico de colisões (Prioritized Planning),
-onde robôs de menor índice têm prioridade de passagem sobre robôs de maior índice.
+Inclui obstáculos estáticos impenetráveis e desvio dinâmico de colisões (Prioritized Planning).
+REGRAS FÍSICAS RESTRITAS:
+- Tamanho visual dos robôs é constante em todos os estados.
+- O centro da estação é uma área exclusiva: atua como obstáculo estático para robôs WORKING e HEADING.
+- Robôs WAITING estacionam ao redor da estação e desligam os motores.
 """
 
 from __future__ import annotations
@@ -33,10 +36,6 @@ PLUGGED_IN = 3
 # ============================================================================
 
 def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
-    """
-    Gera um mapa de navegação em 8 direções com obstáculos estáticos.
-    Impede travessia de quinas e garante a conectividade do espaço livre.
-    """
     rng = np.random.default_rng(seed)
     is_obstacle = rng.random((rows, cols)) < obstacle_prob
     
@@ -61,7 +60,7 @@ def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
             for dr, dc, w in directions:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < rows and 0 <= nc < cols and not is_obstacle[nr, nc]:
-                    # Impede que a diagonal atravesse as "quinas" dos obstáculos
+                    # Impede travessia de quinas
                     if abs(dr) == 1 and abs(dc) == 1:
                         if is_obstacle[r + dr, c] or is_obstacle[r, c + dc]:
                             continue
@@ -181,19 +180,65 @@ def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, 
     raise RuntimeError("O subconjunto de robôs não possui rotas viáveis. Tente aumentar a margem de capacidade.")
 
 
-def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng, working_targets, pos, dynamic_obstacles):
+def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng, working_targets, pos, dynamic_obstacles, station_centers):
     """
-    Calcula o próximo nó, ignorando ativamente os obstáculos dinâmicos (outros robôs).
+    Calcula o próximo nó impondo restrições rígidas sobre a ocupação dos centros das estações.
     """
-    if state[rid] in (WAITING, PLUGGED_IN):
-        return current_v
+    if state[rid] == PLUGGED_IN:
+        sid = assignment.get(rid)
+        if not sid: return current_v
+        station_v = stations[sid]
+        
+        if current_v == station_v:
+            return current_v
+            
+        # O robô Plugado tem o DIREITO de entrar no centro da sua estação
+        choices = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and (u not in station_centers or u == station_v)]
+        if not choices:
+            return current_v
+            
+        return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
+
+    elif state[rid] == WAITING:
+        sid = assignment.get(rid)
+        
+        # Imóvel se já está num lugar seguro e fora de qualquer centro
+        if current_v not in dynamic_obstacles and current_v not in station_centers:
+            return current_v
+            
+        # Se forçado a mover, reajusta a posição sem pisar num centro
+        choices = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and u not in station_centers]
+        if not choices:
+            return current_v
+        
+        if sid:
+            return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
+        return rng.choice(choices)
+
+    elif state[rid] == HEADING:
+        sid = assignment.get(rid)
+        if not sid: return current_v
+        
+        # Proibido entrar no centro de recarga
+        choices = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and u not in station_centers]
+        if current_v not in dynamic_obstacles and current_v not in station_centers:
+            choices.append(current_v)
+            
+        if not choices:
+            return current_v
+            
+        return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
         
     elif state[rid] == WORKING:
         target_v = working_targets[rid]
         if current_v == target_v:
+            # Foge caso um robô prioritário ocupe a sua casa, evitando sempre os centros das estações
+            if current_v in dynamic_obstacles or current_v in station_centers:
+                free = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and u not in station_centers]
+                return rng.choice(free) if free else current_v
             return current_v
             
-        # Busca Dinâmica com A* ignorando obstáculos dinâmicos (Prioritized Planning)
+        # A* ignorando obstáculos dinâmicos e centros de estações (são tratados como paredes)
         pq = [(0.0, current_v)]
         came_from = {current_v: None}
         g_score = {current_v: 0.0}
@@ -204,8 +249,7 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
             if curr == target_v:
                 break
             for nxt, weight in graph[curr]:
-                # DESVIO DINÂMICO: Se a célula está ocupada por um robô de maior prioridade, ignora
-                if nxt in dynamic_obstacles:
+                if nxt in dynamic_obstacles or nxt in station_centers:
                     continue
                     
                 new_g = g_score[curr] + weight
@@ -218,37 +262,26 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
                     
         step = target_v
         if step not in came_from:
-            return current_v  # Sem rota livre atual? Fica parado à espera.
+            if current_v in dynamic_obstacles or current_v in station_centers:
+                free_neighbors = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and u not in station_centers]
+                return rng.choice(free_neighbors) if free_neighbors else current_v
+            return current_v 
+            
         while came_from[step] != current_v:
             step = came_from[step]
             
         return step
-        
-    elif state[rid] == HEADING:
-        sid = assignment.get(rid)
-        if sid is None:
-            return current_v
-            
-        # DESVIO DINÂMICO: Filtra vizinhos ocupados
-        valid_neighbors = [u for u, _ in graph[current_v] if u not in dynamic_obstacles]
-        
-        if not valid_neighbors:
-            return current_v  # Trânsito bloqueado à frente, fica parado
-            
-        best_neighbor = min(valid_neighbors, key=lambda n: cache.get((n, sid), float('inf')))
-        return best_neighbor
 
 
-def interpolate_positions(vertices, target, positions, fraction, jitter):
+def interpolate_positions(vertices, target, positions, fraction):
     out = {}
     for rid, u in vertices.items():
         v = target[rid]
         x0, y0 = positions[u]
         x1, y1 = positions[v]
-        dx, dy = jitter[rid]
         out[rid] = (
-            (1 - fraction) * x0 + fraction * x1 + dx,
-            (1 - fraction) * y0 + fraction * y1 + dy
+            (1 - fraction) * x0 + fraction * x1,
+            (1 - fraction) * y0 + fraction * y1
         )
     return out
 
@@ -275,6 +308,9 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
         robot_soc = soc[rid]
         robot_state = state[rid]
         
+        # O tamanho agora é ÚNICO (constante) para todos os robôs, independentemente do estado
+        marker_size = 120  
+        
         if robot_state == WORKING:
             color = '#999999'
             edgecolor = '#666666'
@@ -285,7 +321,7 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
             edgecolor = 'red' if rid in changed else 'black'
             linewidth = 1.8 if rid in changed else 0.5
             
-        ax.scatter(x, y, s=20 + 60 * robot_soc, color=color, alpha=0.9, edgecolor=edgecolor, linewidth=linewidth, zorder=4)
+        ax.scatter(x, y, s=marker_size, color=color, alpha=0.9, edgecolor=edgecolor, linewidth=linewidth, zorder=4)
         
         status_marker = "⚡" if robot_state == PLUGGED_IN else ""
         ax.annotate(
@@ -298,14 +334,15 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
     assigned_counts = Counter(result.assignment.values()) if result else Counter()
     for j, (sid, v) in enumerate(stations.items()):
         x, y = positions[v]
-        ax.scatter(x, y, s=250, marker='s', color=colors[sid], edgecolor='black', linewidth=1, zorder=7)
+        ax.scatter(x, y, s=300, marker='s', color=colors[sid], edgecolor='black', linewidth=1, zorder=7)
         cap = problem.total_capacity[j] if problem else "N/A"
         ax.text(
-            x, y + 0.33, f'{sid}\n{assigned_counts[sid]}/{cap}',
+            x, y + 0.35, f'{sid}\n{assigned_counts[sid]}/{cap}',
             ha='center', fontsize=7, fontweight='bold', color=colors[sid]
         )
         
-    ax.set_title(f'FSM Swarm: Dynamic Obstacle Avoidance $t_{{{epoch}}}$ + {phase:.2f}', fontweight='bold')
+    # ax.set_title(f'FSM Swarm: Prioritized Plan. \& Strict Core Area $t_{{{epoch}}}$ + {phase:.2f}', fontweight='bold')
+    ax.set_title(f'$t_{{{epoch}}}$ + {phase:.2f}', fontweight='bold')
     
     if result:
         metrics_text = f"Active D-ACO Agents: {len(problem.robot_ids)} | Switches: {int(result.components['switch_count'])}"
@@ -325,6 +362,7 @@ def main():
     p.add_argument('--rows', type=int, default=8)
     p.add_argument('--cols', type=int, default=8)
     p.add_argument('--obstacle-prob', type=float, default=0.15)
+    p.add_argument('--battery-threshold', type=float, default=0.35)
     p.add_argument('--epochs', type=int, default=60)
     p.add_argument('--frames-per-epoch', type=int, default=5)
     p.add_argument('--seed', type=int, default=42)
@@ -353,31 +391,28 @@ def main():
     station_nodes = rng.choice(graph_nodes, size=a.stations, replace=False)
     stations = {f'CS-{i+1}': v for i, v in enumerate(station_nodes)}
     station_ids = tuple(stations.keys())
+    station_centers = set(stations.values())
     
     cache = build_cache_dijkstra(graph, stations)
     
     robot_node_pool = [n for n in graph_nodes if n not in station_nodes]
     
-    # --- TRAVA DE SEGURANÇA: AJUSTA O NÚMERO DE ROBÔS AO TAMANHO DO MAPA 40% de células livres ---
-    if a.robots > int(len(robot_node_pool)*0.60):
-        print(f"\n⚠️ AVISO: O mapa gerado só tem {len(robot_node_pool)} células livres iniciais.")
-        print(f"Reduzindo automaticamente a frota de {a.robots} para {int(len(robot_node_pool)*0.60)} robôs.\n")
-        a.robots = int(len(robot_node_pool)*0.60)
-    # -----------------------------------------------------------------------
+    if a.robots > int(len(robot_node_pool) * 0.60):
+        print(f"\n⚠️ AVISO: Reduzindo a frota para {int(len(robot_node_pool)*0.60)} robôs para evitar superpopulação.\n")
+        a.robots = int(len(robot_node_pool) * 0.60)
         
     robot_start_nodes = rng.choice(robot_node_pool, size=a.robots, replace=False)
     robot_ids = [f'R{i:02d}' for i in range(a.robots)]
     vertices = {rid: v for rid, v in zip(robot_ids, robot_start_nodes)}
     
-    soc = {r: rng.uniform(0.35, 1.0) for r in robot_ids}
+    soc = {r: rng.uniform(a.battery_threshold, 1.0) for r in robot_ids}
     state = {r: WORKING for r in robot_ids}
-    working_targets = {r: int(rng.choice(graph_nodes)) for r in robot_ids}
+    
+    # Waypoints nunca recaem nos centros das estações
+    working_targets = {r: int(rng.choice(robot_node_pool)) for r in robot_ids}
     
     base_cap = np.full(a.stations, np.ceil((a.robots / a.stations) * a.capacity_margin))
     caps = base_cap.astype(int)
-    
-    jr = np.random.default_rng(a.seed + 999)
-    jitter = {r: (jr.uniform(-0.12, 0.12), jr.uniform(-0.12, 0.12)) for r in robot_ids}
     
     model = DynamicRobustACO(
         epoch=a.aco_epochs, pop_size=a.ants, heuristic_power=2.5,
@@ -389,22 +424,24 @@ def main():
     frame = 0
     
     for k in range(a.epochs):
-        # 1. Bateria e Estados Base
+        # 1. Bateria e Entrada na Fila Virtual
         for r in robot_ids:
             if state[r] == WORKING:
                 soc[r] -= rng.uniform(0.06, 0.12)
-                if soc[r] < 0.35:
+                if soc[r] < a.battery_threshold:
                     state[r] = HEADING
             elif state[r] == HEADING:
                 soc[r] -= rng.uniform(0.010, 0.020)
                 sid = previous_assignment.get(r)
-                if sid is not None and vertices[r] == stations[sid]:
-                    state[r] = WAITING
+                if sid is not None:
+                    dist = cache.get((vertices[r], sid), float('inf'))
+                    if dist <= 1.5:
+                        state[r] = WAITING
 
-        # 2. Filas de Espera
+        # 2. Gestão de Filas de Espera e Recarga
         for sid, station_v in stations.items():
-            waiting = [r for r in robot_ids if state[r] == WAITING and vertices[r] == station_v]
-            plugged = [r for r in robot_ids if state[r] == PLUGGED_IN and vertices[r] == station_v]
+            waiting = [r for r in robot_ids if state[r] == WAITING and previous_assignment.get(r) == sid]
+            plugged = [r for r in robot_ids if state[r] == PLUGGED_IN and previous_assignment.get(r) == sid]
             
             free_spots = a.chargers_per_station - len(plugged)
             
@@ -418,13 +455,13 @@ def main():
                 soc[r] = min(1.0, soc[r] + 0.15)
                 if soc[r] >= 1.0:
                     state[r] = WORKING
-                    working_targets[r] = int(rng.choice(graph_nodes))
+                    working_targets[r] = int(rng.choice(robot_node_pool))
                     if r in previous_assignment: del previous_assignment[r]
 
-        # 3. Renovação de Waypoints
+        # 3. Renovação de Waypoints para WORKING
         for r in robot_ids:
             if state[r] == WORKING and vertices[r] == working_targets[r]:
-                working_targets[r] = int(rng.choice(graph_nodes))
+                working_targets[r] = int(rng.choice(robot_node_pool))
 
         # 4. D-ACO
         active_rids = [r for r in robot_ids if state[r] in (HEADING, WAITING, PLUGGED_IN)]
@@ -440,22 +477,24 @@ def main():
             result = model.solve(problem, seed=a.seed + k)
             previous_assignment = dict(result.assignment)
             
-        # 5. PLANEAMENTO PRIORIZADO (Prevenção de Colisões Dinâmicas)
+        # 5. PLANEAMENTO PRIORIZADO
         target = {}
         dynamic_obstacles = set()
         
-        # A ordenação pelo ID (R00, R01, R02...) garante a prioridade
-        for r in sorted(robot_ids):
+        state_priority = {PLUGGED_IN: 0, WAITING: 1, HEADING: 2, WORKING: 3}
+        prioritized_rids = sorted(robot_ids, key=lambda r: (state_priority[state[r]], r))
+        
+        for r in prioritized_rids:
             target[r] = get_next_step(
                 r, vertices[r], state, previous_assignment,
-                graph, cache, stations, rng, working_targets, pos, dynamic_obstacles
+                graph, cache, stations, rng, working_targets, pos, dynamic_obstacles, station_centers
             )
-            # A posição que o robô ocupar será tratada como parede pelos robôs seguintes
             dynamic_obstacles.add(target[r])
             
+        # 6. Renderização de Frames
         for sub in range(a.frames_per_epoch):
             fraction = sub / a.frames_per_epoch
-            xy = interpolate_positions(vertices, target, pos, fraction, jitter)
+            xy = interpolate_positions(vertices, target, pos, fraction)
             fp = frames / f'frame_{frame:05d}.png'
             
             render_fsm(
