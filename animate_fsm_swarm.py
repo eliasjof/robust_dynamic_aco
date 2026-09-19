@@ -1,10 +1,11 @@
 """
 Animação de Enxame Robótico com Máquina de Estados Finita (FSM).
 Inclui obstáculos estáticos impenetráveis e desvio dinâmico de colisões (Prioritized Planning).
-REGRAS FÍSICAS RESTRITAS:
+REGRAS FÍSICAS RESTRITAS (COLISÃO ZERO E REALOCAÇÃO):
+- Bloqueio de Nós e Cruzamentos: Prevenção absoluta de colisões simultâneas.
+- Reversão Dinâmica: Se o D-ACO realocar um robô estacionado para outra base, ele regressa a HEADING.
+- Zoneamento: Waypoints de trabalho são gerados estritamente fora das zonas de recarga.
 - Tamanho visual dos robôs é constante em todos os estados.
-- O centro da estação é uma área exclusiva: atua como obstáculo estático para robôs WORKING e HEADING.
-- Robôs WAITING estacionam ao redor da estação e desligam os motores.
 """
 
 from __future__ import annotations
@@ -35,9 +36,21 @@ PLUGGED_IN = 3
 # GERADORES DE AMBIENTE (MAPA, OBSTÁCULOS E DIJKSTRA)
 # ============================================================================
 
-def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
+def create_custom_grid_graph(rows, cols, num_stations, obstacle_prob=0.15, seed=42):
     rng = np.random.default_rng(seed)
     is_obstacle = rng.random((rows, cols)) < obstacle_prob
+    
+    all_coords = [(r, c) for r in range(rows) for c in range(cols)]
+    station_idx = rng.choice(len(all_coords), size=num_stations, replace=False)
+    station_coords = [all_coords[i] for i in station_idx]
+    
+    # GARANTIA ESPACIAL: Limpar obstáculos ao redor das estações (Matriz 3x3)
+    for sr, sc in station_coords:
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                nr, nc = sr + dr, sc + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    is_obstacle[nr, nc] = False  
     
     pos = {}
     for r in range(rows):
@@ -60,7 +73,6 @@ def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
             for dr, dc, w in directions:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < rows and 0 <= nc < cols and not is_obstacle[nr, nc]:
-                    # Impede travessia de quinas
                     if abs(dr) == 1 and abs(dc) == 1:
                         if is_obstacle[r + dr, c] or is_obstacle[r, c + dc]:
                             continue
@@ -68,7 +80,6 @@ def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
                     nv = nr * cols + nc
                     raw_graph[v].append((nv, w))
 
-    # Extrair o Maior Componente Conexo
     visited = set()
     largest_cc = set()
     for node in raw_graph:
@@ -94,7 +105,11 @@ def create_custom_grid_graph(rows, cols, obstacle_prob=0.15, seed=42):
                 edges.append((v, nv, w))
                 
     obstacle_coords = [(c, r) for r in range(rows) for c in range(cols) if is_obstacle[r, c]]
-    return graph, edges, final_pos, obstacle_coords
+    
+    station_nodes = [r * cols + c for r, c in station_coords]
+    station_nodes = [n for n in station_nodes if n in largest_cc]
+    
+    return graph, edges, final_pos, obstacle_coords, station_nodes
 
 
 def build_cache_dijkstra(graph, stations_dict):
@@ -180,10 +195,19 @@ def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, 
     raise RuntimeError("O subconjunto de robôs não possui rotas viáveis. Tente aumentar a margem de capacidade.")
 
 
-def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng, working_targets, pos, dynamic_obstacles, station_centers):
-    """
-    Calcula o próximo nó impondo restrições rígidas sobre a ocupação dos centros das estações.
-    """
+def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng, working_targets, pos, blocked, station_centers, dynamic_edges, cols):
+    def valid_edge(u, v):
+        if v in blocked: 
+            return False
+        r1, c1 = u // cols, u % cols
+        r2, c2 = v // cols, v % cols
+        if abs(r1 - r2) == 1 and abs(c1 - c2) == 1:
+            cross1 = r1 * cols + c2
+            cross2 = r2 * cols + c1
+            if (cross1, cross2) in dynamic_edges or (cross2, cross1) in dynamic_edges:
+                return False
+        return True
+
     if state[rid] == PLUGGED_IN:
         sid = assignment.get(rid)
         if not sid: return current_v
@@ -192,8 +216,7 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
         if current_v == station_v:
             return current_v
             
-        # O robô Plugado tem o DIREITO de entrar no centro da sua estação
-        choices = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and (u not in station_centers or u == station_v)]
+        choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and (u not in station_centers or u == station_v)]
         if not choices:
             return current_v
             
@@ -202,12 +225,10 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
     elif state[rid] == WAITING:
         sid = assignment.get(rid)
         
-        # Imóvel se já está num lugar seguro e fora de qualquer centro
-        if current_v not in dynamic_obstacles and current_v not in station_centers:
+        if current_v not in station_centers:
             return current_v
             
-        # Se forçado a mover, reajusta a posição sem pisar num centro
-        choices = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and u not in station_centers]
+        choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
         if not choices:
             return current_v
         
@@ -219,9 +240,8 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
         sid = assignment.get(rid)
         if not sid: return current_v
         
-        # Proibido entrar no centro de recarga
-        choices = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and u not in station_centers]
-        if current_v not in dynamic_obstacles and current_v not in station_centers:
+        choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
+        if current_v not in station_centers:
             choices.append(current_v)
             
         if not choices:
@@ -232,13 +252,11 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
     elif state[rid] == WORKING:
         target_v = working_targets[rid]
         if current_v == target_v:
-            # Foge caso um robô prioritário ocupe a sua casa, evitando sempre os centros das estações
-            if current_v in dynamic_obstacles or current_v in station_centers:
-                free = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and u not in station_centers]
+            if current_v in station_centers:
+                free = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
                 return rng.choice(free) if free else current_v
             return current_v
             
-        # A* ignorando obstáculos dinâmicos e centros de estações (são tratados como paredes)
         pq = [(0.0, current_v)]
         came_from = {current_v: None}
         g_score = {current_v: 0.0}
@@ -249,7 +267,7 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
             if curr == target_v:
                 break
             for nxt, weight in graph[curr]:
-                if nxt in dynamic_obstacles or nxt in station_centers:
+                if not valid_edge(curr, nxt) or nxt in station_centers:
                     continue
                     
                 new_g = g_score[curr] + weight
@@ -262,8 +280,8 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
                     
         step = target_v
         if step not in came_from:
-            if current_v in dynamic_obstacles or current_v in station_centers:
-                free_neighbors = [u for u, _ in graph[current_v] if u not in dynamic_obstacles and u not in station_centers]
+            if current_v in station_centers:
+                free_neighbors = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
                 return rng.choice(free_neighbors) if free_neighbors else current_v
             return current_v 
             
@@ -308,7 +326,6 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
         robot_soc = soc[rid]
         robot_state = state[rid]
         
-        # O tamanho agora é ÚNICO (constante) para todos os robôs, independentemente do estado
         marker_size = 120  
         
         if robot_state == WORKING:
@@ -341,7 +358,6 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
             ha='center', fontsize=7, fontweight='bold', color=colors[sid]
         )
         
-    # ax.set_title(f'FSM Swarm: Prioritized Plan. \& Strict Core Area $t_{{{epoch}}}$ + {phase:.2f}', fontweight='bold')
     ax.set_title(f'$t_{{{epoch}}}$ + {phase:.2f}', fontweight='bold')
     
     if result:
@@ -385,13 +401,32 @@ def main():
     
     rng = np.random.default_rng(a.seed)
     
-    graph, edges, pos, obstacle_coords = create_custom_grid_graph(a.rows, a.cols, a.obstacle_prob, a.seed)
+    graph, edges, pos, obstacle_coords, station_nodes = create_custom_grid_graph(
+        a.rows, a.cols, a.stations, a.obstacle_prob, a.seed
+    )
     graph_nodes = list(graph.keys())
     
-    station_nodes = rng.choice(graph_nodes, size=a.stations, replace=False)
     stations = {f'CS-{i+1}': v for i, v in enumerate(station_nodes)}
     station_ids = tuple(stations.keys())
     station_centers = set(stations.values())
+    
+    # === ZONEAMENTO DE RECARGA (3x3) PARA EXCLUIR DOS WAYPOINTS ===
+    station_zone_nodes = set()
+    for v in station_centers:
+        r, c = v // a.cols, v % a.cols
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < a.rows and 0 <= nc < a.cols:
+                    nv = nr * a.cols + nc
+                    if nv in graph_nodes:
+                        station_zone_nodes.add(nv)
+                        
+    # Pool de trabalho é apenas os nós que NÃO fazem parte das zonas de recarga
+    working_node_pool = [n for n in graph_nodes if n not in station_zone_nodes]
+    if not working_node_pool: # Fallback se o mapa for minúsculo
+        working_node_pool = [n for n in graph_nodes if n not in station_centers]
+    # ===============================================================
     
     cache = build_cache_dijkstra(graph, stations)
     
@@ -408,8 +443,8 @@ def main():
     soc = {r: rng.uniform(a.battery_threshold, 1.0) for r in robot_ids}
     state = {r: WORKING for r in robot_ids}
     
-    # Waypoints nunca recaem nos centros das estações
-    working_targets = {r: int(rng.choice(robot_node_pool)) for r in robot_ids}
+    # Agora os robôs procuram trabalho apenas no working_node_pool
+    working_targets = {r: int(rng.choice(working_node_pool)) for r in robot_ids}
     
     base_cap = np.full(a.stations, np.ceil((a.robots / a.stations) * a.capacity_margin))
     caps = base_cap.astype(int)
@@ -455,13 +490,13 @@ def main():
                 soc[r] = min(1.0, soc[r] + 0.15)
                 if soc[r] >= 1.0:
                     state[r] = WORKING
-                    working_targets[r] = int(rng.choice(robot_node_pool))
+                    working_targets[r] = int(rng.choice(working_node_pool))
                     if r in previous_assignment: del previous_assignment[r]
 
         # 3. Renovação de Waypoints para WORKING
         for r in robot_ids:
             if state[r] == WORKING and vertices[r] == working_targets[r]:
-                working_targets[r] = int(rng.choice(robot_node_pool))
+                working_targets[r] = int(rng.choice(working_node_pool))
 
         # 4. D-ACO
         active_rids = [r for r in robot_ids if state[r] in (HEADING, WAITING, PLUGGED_IN)]
@@ -477,19 +512,37 @@ def main():
             result = model.solve(problem, seed=a.seed + k)
             previous_assignment = dict(result.assignment)
             
-        # 5. PLANEAMENTO PRIORIZADO
+            for r in active_rids:
+                if state[r] in (WAITING, PLUGGED_IN):
+                    new_sid = previous_assignment.get(r)
+                    if new_sid:
+                        dist = cache.get((vertices[r], new_sid), float('inf'))
+                        if dist > 1.5:
+                            state[r] = HEADING
+            
+        # 5. PLANEAMENTO PRIORIZADO COM COLISÃO ZERO (Nós + Arestas Cruzadas)
         target = {}
         dynamic_obstacles = set()
+        dynamic_edges = set()
         
         state_priority = {PLUGGED_IN: 0, WAITING: 1, HEADING: 2, WORKING: 3}
         prioritized_rids = sorted(robot_ids, key=lambda r: (state_priority[state[r]], r))
         
+        unplanned_positions = {vertices[r] for r in robot_ids}
+        
         for r in prioritized_rids:
-            target[r] = get_next_step(
+            unplanned_positions.remove(vertices[r])
+            blocked = dynamic_obstacles.union(unplanned_positions)
+            
+            nxt_step = get_next_step(
                 r, vertices[r], state, previous_assignment,
-                graph, cache, stations, rng, working_targets, pos, dynamic_obstacles, station_centers
+                graph, cache, stations, rng, working_targets, pos, 
+                blocked, station_centers, dynamic_edges, a.cols
             )
-            dynamic_obstacles.add(target[r])
+            
+            target[r] = nxt_step
+            dynamic_obstacles.add(nxt_step)
+            dynamic_edges.add((vertices[r], nxt_step))
             
         # 6. Renderização de Frames
         for sub in range(a.frames_per_epoch):
