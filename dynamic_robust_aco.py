@@ -172,6 +172,7 @@ class DynamicRobustACO(_MealpyOptimizer):
         self.history_hamming: List[float] = []
         self.history_pheromone_entropy: List[float] = []
         self.history_tau_ratio: List[float] = []
+        self.history_iter: Dict[str, List[float]] = {}
         self.g_best: Optional[ACOResult] = None
 
     def reset_memory(self) -> None:
@@ -246,7 +247,7 @@ class DynamicRobustACO(_MealpyOptimizer):
         robust = DynamicRobustACO._robust_term(active_dev, problem.gamma)
         new_load = np.bincount(assignment, minlength=len(problem.station_ids))
         total_load = problem.current_load + new_load
-        # The station capacity is the total admitted population: chargers + finite queue.
+        
         if np.any(total_load > problem.total_capacity):
             return math.inf, {"nominal": nominal, "robust": robust, "congestion": math.inf, "queue": math.inf, "waiting": math.inf, "switching": math.inf}
         chargers = np.asarray(getattr(problem, "charger_capacity", problem.total_capacity), dtype=int)
@@ -258,7 +259,6 @@ class DynamicRobustACO(_MealpyOptimizer):
         waiting_cost = 0.0
         for j in range(len(problem.station_ids)):
             members = [i for i in range(r) if int(assignment[i]) == j]
-            # Lowest SoC receives strict priority; robot index is the deterministic tie-break.
             members.sort(key=lambda i: (float(soc[i]), i))
             occupied = int(problem.current_load[j])
             for rank, i in enumerate(members, start=1):
@@ -290,7 +290,6 @@ class DynamicRobustACO(_MealpyOptimizer):
     def _construct_ant(self, problem: ChargingAssignmentProblem, rng: np.random.Generator) -> Optional[np.ndarray]:
         mask = problem.feasible_mask
         r = len(problem.robot_ids)
-        # Critical robots first: fewer feasible stations, then smaller slack.
         min_slack = np.where(mask, problem.travel_budget[:, None] - problem.nominal_cost - problem.deviation, np.inf).min(axis=1)
         order = sorted(range(r), key=lambda i: (int(mask[i].sum()), float(min_slack[i])))
         gamma_fraction = problem.gamma / max(r, 1) if self.robust_heuristic_fraction else 0.0
@@ -364,12 +363,6 @@ class DynamicRobustACO(_MealpyOptimizer):
         seed: Optional[int] = None,
         **kwargs,
     ) -> ACOResult:
-        """Solve one decision epoch and retain pheromone for the next call.
-
-        The signature intentionally follows MEALPY's ``solve(problem, ...)``
-        convention. The domain-specific problem object avoids forcing a
-        combinatorial assignment into an artificial continuous vector.
-        """
         if not isinstance(problem, ChargingAssignmentProblem):
             raise TypeError("problem must be a ChargingAssignmentProblem")
         start = time.perf_counter()
@@ -380,6 +373,8 @@ class DynamicRobustACO(_MealpyOptimizer):
         self._transfer_pheromone(problem)
         best_assignment = baseline.copy()
         best_fitness, best_components = self.evaluate(problem, best_assignment)
+        
+        self.history_iter = {'fitness_iter': [], 'pheromone_mean': []}
         self.history_best = [best_fitness]
         self.history_time = [0.0]
         self.history_fe = [1]
@@ -429,6 +424,12 @@ class DynamicRobustACO(_MealpyOptimizer):
                 self.history_epoch_std.append(0.0)
                 self.history_diversity.append(0.0)
                 self.history_hamming.append(0.0)
+            
+            # Adicionado para suportar os gráficos de convergência por iteração
+            self.history_iter['fitness_iter'].append(float(best_fitness))
+            mean_pher = float(np.mean(list(self.pheromone.values()))) if self.pheromone else 0.0
+            self.history_iter['pheromone_mean'].append(mean_pher)
+            
             entropy, tau_ratio = self._pheromone_diagnostics(problem)
             self.history_pheromone_entropy.append(entropy)
             self.history_tau_ratio.append(tau_ratio)

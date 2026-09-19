@@ -1,10 +1,11 @@
 """
-Animação de Enxame Robótico com Máquina de Estados Finita (FSM).
-Inclui obstáculos estáticos impenetráveis e desvio dinâmico de colisões (Prioritized Planning).
+Animação de Enxame Robótico com Máquina de Estados Finita (FSM) e Extração Académica.
 REGRAS FÍSICAS RESTRITAS (COLISÃO ZERO E RETOMA DE TAREFAS):
 - Retoma de Tarefa: Robôs mantêm o seu waypoint original após recarregarem.
-- Colisão Zero: Nós e Arestas Diagonais (X) bloqueadas para cruzamentos simultâneos.
-- Movimento Suave: Interpolação ease-in-out síncrona, sem perturbações de velocidade.
+- Colisão Zero Absoluta: Prevenção de nós ocupados e cruzamento em X (diagonais).
+- Incerteza Dinâmica: Escalas de Robustez e Gamma ajustáveis.
+- Normalização de Métricas: O custo nos gráficos é avaliado POR AGENTE ATIVO.
+- Micro-convergência: Plotagem de todas as curvas individuais do D-ACO.
 """
 
 from __future__ import annotations
@@ -15,25 +16,20 @@ import shutil
 import subprocess
 from collections import Counter
 from pathlib import Path
+import pandas as pd
 
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 
-# Importação do otimizador D-ACO e funções base
 from dynamic_robust_aco import DynamicRobustACO, ChargingAssignmentProblem
 from animate_dynamic_swarm import robust_contributions, find_ffmpeg
 
-# Definição dos Estados Físicos
 WORKING = 0
 HEADING = 1
 WAITING = 2      
 PLUGGED_IN = 3   
 
-
-# ============================================================================
-# GERADORES DE AMBIENTE (MAPA, OBSTÁCULOS E DIJKSTRA)
-# ============================================================================
 
 def create_custom_grid_graph(rows, cols, num_stations, obstacle_prob=0.15, seed=42):
     rng = np.random.default_rng(seed)
@@ -43,7 +39,6 @@ def create_custom_grid_graph(rows, cols, num_stations, obstacle_prob=0.15, seed=
     station_idx = rng.choice(len(all_coords), size=num_stations, replace=False)
     station_coords = [all_coords[i] for i in station_idx]
     
-    # GARANTIA ESPACIAL: Limpar obstáculos ao redor das estações (Matriz 3x3)
     for sr, sc in station_coords:
         for dr in [-1, 0, 1]:
             for dc in [-1, 0, 1]:
@@ -150,11 +145,12 @@ def ensure_k_station_reachability_local(c_subset, d_subset, proposed_L, k, slack
             L[i] = max(L[i], sorted_req[k - 1] + slack)
     return L
 
+
 # ============================================================================
 # LÓGICA DO FSM E OTIMIZAÇÃO
 # ============================================================================
 
-def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, caps, load, previous, min_reachable, chargers_per_station, gamma_frac=0.25):
+def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, caps, load, previous, min_reachable, chargers_per_station, gamma_frac, dev_mult, dev_base):
     if not active_rids:
         return None, 0
 
@@ -162,7 +158,8 @@ def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, 
     active_vertices = {r: vertices[r] for r in active_rids}
     
     c_subset = make_cost_matrix_local(active_vertices, station_ids, cache)
-    d_subset = 0.15 * c_subset + 0.25
+    d_subset = dev_mult * c_subset + dev_base 
+    
     proposed_L = 40.0 * active_soc - 2.0
     first_k = min(max(1, min_reachable), len(station_ids))
     
@@ -211,41 +208,25 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
         sid = assignment.get(rid)
         if not sid: return current_v
         station_v = stations[sid]
-        
-        if current_v == station_v:
-            return current_v
-            
+        if current_v == station_v: return current_v
         choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and (u not in station_centers or u == station_v)]
-        if not choices:
-            return current_v
-            
+        if not choices: return current_v
         return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
 
     elif state[rid] == WAITING:
         sid = assignment.get(rid)
-        
-        if current_v not in station_centers:
-            return current_v
-            
+        if current_v not in station_centers: return current_v
         choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
-        if not choices:
-            return current_v
-        
-        if sid:
-            return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
+        if not choices: return current_v
+        if sid: return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
         return rng.choice(choices)
 
     elif state[rid] == HEADING:
         sid = assignment.get(rid)
         if not sid: return current_v
-        
         choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
-        if current_v not in station_centers:
-            choices.append(current_v)
-            
-        if not choices:
-            return current_v
-            
+        if current_v not in station_centers: choices.append(current_v)
+        if not choices: return current_v
         return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
         
     elif state[rid] == WORKING:
@@ -263,12 +244,9 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
         
         while pq:
             _, curr = heapq.heappop(pq)
-            if curr == target_v:
-                break
+            if curr == target_v: break
             for nxt, weight in graph[curr]:
-                if not valid_edge(curr, nxt) or nxt in station_centers:
-                    continue
-                    
+                if not valid_edge(curr, nxt) or nxt in station_centers: continue
                 new_g = g_score[curr] + weight
                 if nxt not in g_score or new_g < g_score[nxt]:
                     g_score[nxt] = new_g
@@ -283,26 +261,99 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
                 free_neighbors = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
                 return rng.choice(free_neighbors) if free_neighbors else current_v
             return current_v 
-            
-        while came_from[step] != current_v:
-            step = came_from[step]
-            
+        while came_from[step] != current_v: step = came_from[step]
         return step
 
 
 def interpolate_positions(vertices, target, positions, fraction):
-    """ Interpolação suave e homogénea (ease-in-out) - remove o efeito anda-e-para """
     f = fraction * fraction * (3 - 2 * fraction)
     out = {}
     for rid, u in vertices.items():
         v = target[rid]
         x0, y0 = positions[u]
         x1, y1 = positions[v]
-        out[rid] = (
-            (1 - f) * x0 + f * x1,
-            (1 - f) * y0 + f * y1
-        )
+        out[rid] = ((1 - f) * x0 + f * x1, (1 - f) * y0 + f * y1)
     return out
+
+
+def plot_academic_results(macro_metrics_df, aco_snapshots, out_dir):
+    plt.rcParams.update({
+        'font.family': 'serif',
+        'axes.titlesize': 12,
+        'axes.labelsize': 11,
+        'xtick.labelsize': 9,
+        'ytick.labelsize': 9,
+        'legend.fontsize': 9,
+        'figure.dpi': 300
+    })
+
+    plots_dir = out_dir / 'academic_plots'
+    plots_dir.mkdir(exist_ok=True)
+
+    fig, ax1 = plt.subplots(figsize=(7, 4.5))
+    ax1.plot(macro_metrics_df['epoch'], macro_metrics_df['fitness_per_agent'], 'k-', linewidth=2, label='Avg Fitness per Agent')
+    ax1.plot(macro_metrics_df['epoch'], macro_metrics_df['robust_cost_per_agent'], 'r--', linewidth=1.5, label='Avg Robust Cost')
+    ax1.plot(macro_metrics_df['epoch'], macro_metrics_df['congestion_per_agent'], 'b-.', linewidth=1.5, label='Avg Congestion Penalty')
+    ax1.set_xlabel('Decision Epoch ($t_k$)')
+    ax1.set_ylabel('Normalized Cost / Active Agent')
+    ax1.set_title('Macro-Convergence: Normalized D-ACO Cost over Time')
+    ax1.grid(True, linestyle=':', alpha=0.7)
+    ax1.legend(loc='upper right')
+    fig.tight_layout()
+    fig.savefig(plots_dir / '1_macro_convergence.pdf')
+    fig.savefig(plots_dir / '1_macro_convergence.png')
+    plt.close(fig)
+
+    fig, ax1 = plt.subplots(figsize=(7, 4.5))
+    color = 'tab:green'
+    ax1.set_xlabel('Decision Epoch ($t_k$)')
+    ax1.set_ylabel('Average Swarm SoC (%)', color=color)
+    ax1.plot(macro_metrics_df['epoch'], macro_metrics_df['avg_soc'] * 100, color=color, linewidth=2)
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_ylim(0, 100)
+    ax1.grid(True, linestyle=':', alpha=0.7)
+    
+    ax2 = ax1.twinx()  
+    color = 'tab:purple'
+    ax2.set_ylabel('Active D-ACO Agents', color=color)  
+    ax2.step(macro_metrics_df['epoch'], macro_metrics_df['active_agents'], color=color, linestyle='--', linewidth=1.5)
+    ax2.tick_params(axis='y', labelcolor=color)
+    ax2.set_ylim(0, max(macro_metrics_df['active_agents']) + 2)
+
+    plt.title('Swarm Energetic Health and Workload')
+    fig.tight_layout()
+    fig.savefig(plots_dir / '2_swarm_health.pdf')
+    fig.savefig(plots_dir / '2_swarm_health.png')
+    plt.close(fig)
+
+    if aco_snapshots:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        cmap = plt.get_cmap('viridis')
+        keys = sorted(list(aco_snapshots.keys()))
+        
+        # Plotar todas as curvas com colormap
+        for idx, tk in enumerate(keys):
+            data = aco_snapshots[tk]
+            if 'fitness_iter' in data and len(data['fitness_iter']) > 0:
+                color = cmap(idx / max(1, len(keys) - 1))
+                ax.plot(range(len(data['fitness_iter'])), data['fitness_iter'], 
+                        color=color, alpha=0.7, linewidth=1.2)
+                
+        ax.set_xlabel('ACO Iteration (Internal)')
+        ax.set_ylabel('Normalized Best Fitness / Agent')
+        ax.set_title('Internal D-ACO Convergence Profile (All Epochs)')
+        ax.grid(True, linestyle=':', alpha=0.7)
+        
+        # Colorbar para indicar a passagem do tempo
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=min(keys), vmax=max(keys)))
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax)
+        cbar.set_label('Decision Epoch ($t_k$)')
+        
+        fig.tight_layout()
+        fig.savefig(plots_dir / '3_micro_aco_convergence_all.pdf')
+        fig.savefig(plots_dir / '3_micro_aco_convergence_all.png')
+        plt.close(fig)
 
 
 def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, xy, soc, state, problem, result, previous, working_targets, label_fontsize=5.6):
@@ -322,20 +373,18 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
     if result and problem:
         changed = {r for r, s in result.assignment.items() if previous and previous.get(r) != s}
         
-    # --- RENDERIZAÇÃO DOS WAYPOINTS DOS ROBÔS WORKING ---
     for rid, target_v in working_targets.items():
         if state[rid] == WORKING:
             tx, ty = positions[target_v]
             ax.scatter(tx, ty, s=30, marker='d', color='#888888', zorder=2, linewidth=1.2)
             ax.text(tx, ty + 0.20, f'{rid}', color='#555555', fontsize=4.2, ha='center', fontweight='bold', zorder=2)
-    # ----------------------------------------------------
         
     for rid, coords in xy.items():
         x, y = coords
         robot_soc = soc[rid]
         robot_state = state[rid]
         
-        marker_size = 60  
+        marker_size = 120  
         
         if robot_state == WORKING:
             color = '#999999'
@@ -388,10 +437,16 @@ def main():
     p.add_argument('--cols', type=int, default=8)
     p.add_argument('--obstacle-prob', type=float, default=0.15)
     p.add_argument('--battery-threshold', type=float, default=0.35)
+    
+    p.add_argument('--gamma-frac', type=float, default=0.60, help='Percentagem da frota a imunizar contra atrasos')
+    p.add_argument('--dev-mult', type=float, default=5.0, help='Multiplicador de incerteza por distância percorrida')
+    p.add_argument('--dev-base', type=float, default=2.0, help='Incerteza/atraso fixo mínimo de qualquer viagem')
+    
     p.add_argument('--epochs', type=int, default=60)
     p.add_argument('--frames-per-epoch', type=int, default=5)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--output', default='fsm_animation')
+    p.add_argument('--save-data', action='store_true', default=True, help="Gravar CSV e Gráficos")
     
     p.add_argument('--aco-epochs', type=int, default=25)
     p.add_argument('--ants', type=int, default=25)
@@ -421,7 +476,6 @@ def main():
     
     cache = build_cache_dijkstra(graph, stations)
     
-    # === ZONEAMENTO DE RECARGA (3x3) PARA EXCLUIR DOS WAYPOINTS ===
     station_zone_nodes = set()
     for v in station_centers:
         r_idx, c_idx = v // a.cols, v % a.cols
@@ -433,16 +487,13 @@ def main():
                     if nv in graph_nodes:
                         station_zone_nodes.add(nv)
                         
-    # Working pool: Exclui a zona das estações
     working_node_pool = [n for n in graph_nodes if n not in station_zone_nodes]
     if not working_node_pool: 
         working_node_pool = [n for n in graph_nodes if n not in station_centers]
-    # ===============================================================
     
     robot_node_pool = [n for n in graph_nodes if n not in station_nodes]
     
     if a.robots > int(len(robot_node_pool) * 0.60):
-        print(f"\n⚠️ AVISO: Reduzindo a frota para {int(len(robot_node_pool)*0.60)} robôs para evitar superpopulação.\n")
         a.robots = int(len(robot_node_pool) * 0.60)
         
     robot_start_nodes = rng.choice(robot_node_pool, size=a.robots, replace=False)
@@ -456,6 +507,9 @@ def main():
     
     base_cap = np.full(a.stations, np.ceil((a.robots / a.stations) * a.capacity_margin))
     caps = base_cap.astype(int)
+
+    # Tratamento para ignorar o tempo limite se max_time for negativo
+    time_limit = a.max_time if a.max_time > 0 else None
     
     model = DynamicRobustACO(
         epoch=a.aco_epochs, pop_size=a.ants, heuristic_power=2.5,
@@ -464,10 +518,15 @@ def main():
     
     previous_assignment = {}
     paths = []
+
+
+
     frame = 0
     
+    macro_data = []
+    aco_snapshots = {}
+    
     for k in range(a.epochs):
-        # 1. Bateria e Entrada na Fila Virtual
         for r in robot_ids:
             if state[r] == WORKING:
                 soc[r] -= rng.uniform(0.06, 0.12)
@@ -481,7 +540,6 @@ def main():
                     if dist <= 1.5:
                         state[r] = WAITING
 
-        # 2. Gestão de Filas de Espera e Recarga
         for sid, station_v in stations.items():
             waiting = [r for r in robot_ids if state[r] == WAITING and previous_assignment.get(r) == sid]
             plugged = [r for r in robot_ids if state[r] == PLUGGED_IN and previous_assignment.get(r) == sid]
@@ -498,28 +556,45 @@ def main():
                 soc[r] = min(1.0, soc[r] + 0.15)
                 if soc[r] >= 1.0:
                     state[r] = WORKING
-                    # CORREÇÃO: Não gera novo waypoint. O robô memoriza a tarefa interrompida!
                     if r in previous_assignment: del previous_assignment[r]
 
-        # 3. Renovação de Waypoints para WORKING
         for r in robot_ids:
-            # Só sorteia novo destino SE já alcançou o target antigo
             if state[r] == WORKING and vertices[r] == working_targets[r]:
                 working_targets[r] = int(rng.choice(working_node_pool))
 
-        # 4. D-ACO
         active_rids = [r for r in robot_ids if state[r] in (HEADING, WAITING, PLUGGED_IN)]
         load = np.zeros(a.stations, dtype=int)
         
         problem, kused = build_subset_problem(
             model, active_rids, station_ids, vertices, cache,
-            soc, caps, load, previous_assignment, a.minimum_reachable, a.chargers_per_station
+            soc, caps, load, previous_assignment, a.minimum_reachable, a.chargers_per_station,
+            a.gamma_frac, a.dev_mult, a.dev_base
         )
         
         result = None
         if problem:
             result = model.solve(problem, seed=a.seed + k)
             previous_assignment = dict(result.assignment)
+            
+            num_active = len(active_rids)
+            avg_soc = np.mean(list(soc.values()))
+            macro_data.append({
+                'epoch': k,
+                'active_agents': num_active,
+                'avg_soc': avg_soc,
+                'fitness_per_agent': result.fitness / num_active if num_active else 0,
+                'robust_cost_per_agent': result.components.get('robust', 0) / num_active if num_active else 0,
+                'congestion_per_agent': result.components.get('congestion', 0) / num_active if num_active else 0,
+                'switches': result.components.get('switch_count', 0)
+            })
+            
+            # --- CORREÇÃO: Capturar a convergência EM TODAS AS ÉPOCAS com agentes ativos ---
+            if num_active > 0 and hasattr(model, 'history_iter'):
+                raw_fitness_iter = model.history_iter.get('fitness_iter', [])
+                norm_fitness_iter = [fit / num_active for fit in raw_fitness_iter]
+                aco_snapshots[k] = {
+                    'fitness_iter': norm_fitness_iter
+                }
             
             for r in active_rids:
                 if state[r] in (WAITING, PLUGGED_IN):
@@ -529,7 +604,6 @@ def main():
                         if dist > 1.5:
                             state[r] = HEADING
             
-        # 5. PLANEAMENTO PRIORIZADO COM COLISÃO ZERO (Nós + Arestas Cruzadas)
         target = {}
         dynamic_obstacles = set()
         dynamic_edges = set()
@@ -553,7 +627,6 @@ def main():
             dynamic_obstacles.add(nxt_step)
             dynamic_edges.add((vertices[r], nxt_step))
             
-        # 6. Renderização de Frames
         for sub in range(a.frames_per_epoch):
             fraction = sub / a.frames_per_epoch
             xy = interpolate_positions(vertices, target, pos, fraction)
@@ -569,6 +642,14 @@ def main():
         vertices = target
         
     print(f'Geração concluída. Guardados {len(paths)} frames em {out}')
+    
+    if a.save_data and len(macro_data) > 0:
+        print("\n📈 A processar métricas e gerar gráficos...")
+        df_macro = pd.DataFrame(macro_data)
+        data_dir = out / 'results_data'
+        data_dir.mkdir(exist_ok=True)
+        df_macro.to_csv(data_dir / 'macro_metrics_evolution.csv', index=False)
+        plot_academic_results(df_macro, aco_snapshots, out)
 
     images = [Image.open(x).convert('RGB') for x in paths]
     duration = int(round(1000 / a.fps))
