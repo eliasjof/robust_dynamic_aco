@@ -1,11 +1,10 @@
 """
 Animação de Enxame Robótico com Máquina de Estados Finita (FSM).
 Inclui obstáculos estáticos impenetráveis e desvio dinâmico de colisões (Prioritized Planning).
-REGRAS FÍSICAS RESTRITAS (COLISÃO ZERO E REALOCAÇÃO):
-- Bloqueio de Nós e Cruzamentos: Prevenção absoluta de colisões simultâneas.
-- Reversão Dinâmica: Se o D-ACO realocar um robô estacionado para outra base, ele regressa a HEADING.
-- Zoneamento: Waypoints de trabalho são gerados estritamente fora das zonas de recarga.
-- Tamanho visual dos robôs é constante em todos os estados.
+REGRAS FÍSICAS RESTRITAS (COLISÃO ZERO E RETOMA DE TAREFAS):
+- Retoma de Tarefa: Robôs mantêm o seu waypoint original após recarregarem.
+- Colisão Zero: Nós e Arestas Diagonais (X) bloqueadas para cruzamentos simultâneos.
+- Movimento Suave: Interpolação ease-in-out síncrona, sem perturbações de velocidade.
 """
 
 from __future__ import annotations
@@ -192,7 +191,7 @@ def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, 
         if model._maximum_b_matching(problem) is not None:
             return problem, k
             
-    raise RuntimeError("O subconjunto de robôs não possui rotas viáveis. Tente aumentar a margem de capacidade.")
+    raise RuntimeError("O subconjunto de robôs não possui rotas viáveis. Tente aumentar a margem de capacidade (--capacity-margin).")
 
 
 def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng, working_targets, pos, blocked, station_centers, dynamic_edges, cols):
@@ -292,19 +291,21 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
 
 
 def interpolate_positions(vertices, target, positions, fraction):
+    """ Interpolação suave e homogénea (ease-in-out) - remove o efeito anda-e-para """
+    f = fraction * fraction * (3 - 2 * fraction)
     out = {}
     for rid, u in vertices.items():
         v = target[rid]
         x0, y0 = positions[u]
         x1, y1 = positions[v]
         out[rid] = (
-            (1 - fraction) * x0 + fraction * x1,
-            (1 - fraction) * y0 + fraction * y1
+            (1 - f) * x0 + f * x1,
+            (1 - f) * y0 + f * y1
         )
     return out
 
 
-def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, xy, soc, state, problem, result, previous, working_targets, label_fontsize=4.6):
+def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, xy, soc, state, problem, result, previous, working_targets, label_fontsize=5.6):
     fig, ax = plt.subplots(figsize=(8, 7))
     cmap = plt.get_cmap('tab10')
     
@@ -321,12 +322,20 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
     if result and problem:
         changed = {r for r, s in result.assignment.items() if previous and previous.get(r) != s}
         
+    # --- RENDERIZAÇÃO DOS WAYPOINTS DOS ROBÔS WORKING ---
+    for rid, target_v in working_targets.items():
+        if state[rid] == WORKING:
+            tx, ty = positions[target_v]
+            ax.scatter(tx, ty, s=30, marker='d', color='#888888', zorder=2, linewidth=1.2)
+            ax.text(tx, ty + 0.20, f'{rid}', color='#555555', fontsize=4.2, ha='center', fontweight='bold', zorder=2)
+    # ----------------------------------------------------
+        
     for rid, coords in xy.items():
         x, y = coords
         robot_soc = soc[rid]
         robot_state = state[rid]
         
-        marker_size = 120  
+        marker_size = 60  
         
         if robot_state == WORKING:
             color = '#999999'
@@ -410,25 +419,25 @@ def main():
     station_ids = tuple(stations.keys())
     station_centers = set(stations.values())
     
+    cache = build_cache_dijkstra(graph, stations)
+    
     # === ZONEAMENTO DE RECARGA (3x3) PARA EXCLUIR DOS WAYPOINTS ===
     station_zone_nodes = set()
     for v in station_centers:
-        r, c = v // a.cols, v % a.cols
+        r_idx, c_idx = v // a.cols, v % a.cols
         for dr in [-1, 0, 1]:
             for dc in [-1, 0, 1]:
-                nr, nc = r + dr, c + dc
+                nr, nc = r_idx + dr, c_idx + dc
                 if 0 <= nr < a.rows and 0 <= nc < a.cols:
                     nv = nr * a.cols + nc
                     if nv in graph_nodes:
                         station_zone_nodes.add(nv)
                         
-    # Pool de trabalho é apenas os nós que NÃO fazem parte das zonas de recarga
+    # Working pool: Exclui a zona das estações
     working_node_pool = [n for n in graph_nodes if n not in station_zone_nodes]
-    if not working_node_pool: # Fallback se o mapa for minúsculo
+    if not working_node_pool: 
         working_node_pool = [n for n in graph_nodes if n not in station_centers]
     # ===============================================================
-    
-    cache = build_cache_dijkstra(graph, stations)
     
     robot_node_pool = [n for n in graph_nodes if n not in station_nodes]
     
@@ -443,7 +452,6 @@ def main():
     soc = {r: rng.uniform(a.battery_threshold, 1.0) for r in robot_ids}
     state = {r: WORKING for r in robot_ids}
     
-    # Agora os robôs procuram trabalho apenas no working_node_pool
     working_targets = {r: int(rng.choice(working_node_pool)) for r in robot_ids}
     
     base_cap = np.full(a.stations, np.ceil((a.robots / a.stations) * a.capacity_margin))
@@ -490,11 +498,12 @@ def main():
                 soc[r] = min(1.0, soc[r] + 0.15)
                 if soc[r] >= 1.0:
                     state[r] = WORKING
-                    working_targets[r] = int(rng.choice(working_node_pool))
+                    # CORREÇÃO: Não gera novo waypoint. O robô memoriza a tarefa interrompida!
                     if r in previous_assignment: del previous_assignment[r]
 
         # 3. Renovação de Waypoints para WORKING
         for r in robot_ids:
+            # Só sorteia novo destino SE já alcançou o target antigo
             if state[r] == WORKING and vertices[r] == working_targets[r]:
                 working_targets[r] = int(rng.choice(working_node_pool))
 

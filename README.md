@@ -194,3 +194,9 @@ or `--label-mode none`. Font size is controlled by `--label-fontsize`.
 - Prioridade estrita por menor SoC, com indice do robo como desempate deterministico.
 - A funcao objetivo inclui `queue` (penalizacao por posicao alem dos carregadores) e `waiting` (ciclos de espera vezes o tempo de recarga).
 - Os labels da animacao suave mostram ordem/tamanho da fila e espera; os labels das estacoes mostram ocupacao e fila.
+
+## Running
+
+```
+animate_fsm_swarm.py --robots 10 --stations 3 --rows 10 --cols 10 --epochs 10 --aco-epochs 100 --ants 20 --max-time 0.15 --output animation_labels --save-mp4 --fps 2 --frames-per-epoch 10 --capacity-margin 1.0 --chargers-per-station 1 --obstacle-prob 0.2 --battery-threshold 0.3 
+```
