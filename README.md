@@ -198,5 +198,5 @@ or `--label-mode none`. Font size is controlled by `--label-fontsize`.
 ## Running
 
 ```
-animate_fsm_swarm.py --robots 30 --stations 6 --rows 20 --cols 20 --epochs 35 --aco-epochs 120 --ants 50 --max-time -1.0 --output animation_labels --save-mp4 --fps 2 --frames-per-epoch 10 --capacity-margin 1.0 --chargers-per-station 1 --obstacle-prob 0.2 --battery-threshold 0.35 --seed 430 --internal-heatmap-epoch 30 --dev-base 25.0 --dev-mult 1.5 --q-pheromone 200.0
+animate_fsm_swarm.py --robots 35 --stations 6 --rows 20 --cols 20 --epochs 50 --aco-epochs 140 --ants 60 --max-time -1.0 --output animation_labels --save-mp4 --fps 2 --frames-per-epoch 10 --capacity-margin 1.0 --chargers-per-station 1 --obstacle-prob 0.2 --battery-threshold 0.3 --seed 430 --internal-heatmap-epoch 30 --dev-base 25.0 --dev-mult 1.5 --q-pheromone 200.0
 ```

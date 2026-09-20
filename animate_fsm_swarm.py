@@ -2,9 +2,10 @@
 Animação de Enxame Robótico com Máquina de Estados Finita (FSM) e Extração Académica.
 REGRAS FÍSICAS RESTRITAS:
 - Task-Aware Routing (Look-ahead): Otimização prevê a distância da recarga até a próxima tarefa.
-- Soft Constraint: Prevenção de Crashes. O D-ACO penaliza a inanição mas não aborta a simulação.
+- Prioridade Real de Trânsito: Robôs com menor SoC (Bateria) e menor distância têm prioridade de passagem.
 - Envelope de Bertsimas-Sim: Cronometragem com Acoplamento de Perímetro (-1 hop).
-- Normalização de Probabilidade: Heatmaps exibem a % de Confiança do D-ACO.
+- ATRITO DE FILA FÍSICO: D-ACO penaliza inanição letal integrando a drenagem de bateria na fila.
+- Limite Letal de Sobrevivência (Bottleneck Analysis): Penalidade pesada para provocar e analisar inanições de frota.
 - Colisão Zero Absoluta: Prevenção de nós ocupados e cruzamento em X (diagonais).
 """
 
@@ -155,6 +156,16 @@ def make_cost_matrix_local(active_rids, active_vertices, station_ids, cache_dist
     return c_subset
 
 
+def ensure_k_station_reachability_local(c_subset, d_subset, proposed_L, k, slack=0.50):
+    L = proposed_L.copy()
+    req = c_subset + d_subset
+    for i in range(len(L)):
+        sorted_req = np.sort(req[i])
+        if k <= len(sorted_req):
+            L[i] = max(L[i], sorted_req[k - 1] + slack)
+    return L
+
+
 def build_subset_problem(model, active_rids, station_ids, vertices, cache_dist, soc, caps, load, previous, min_reachable, chargers_per_station, gamma_frac, dev_mult, dev_base, working_targets, lookahead_weight):
     if not active_rids:
         return None, 0
@@ -165,17 +176,15 @@ def build_subset_problem(model, active_rids, station_ids, vertices, cache_dist, 
     c_subset = make_cost_matrix_local(active_rids, active_vertices, station_ids, cache_dist, working_targets, lookahead_weight)
     d_subset = dev_mult * c_subset + dev_base 
     
-    # ATUALIZAÇÃO: Para impedir o CRASH da simulação, damos um orçamento matemático infinito
-    # para a filtragem inicial. O custo letal será cobrado na função evaluate do ACO!
     infinite_budget = np.full(len(active_rids), np.inf)
-    true_L = (active_soc / 0.020) - 1.0 # O orçamento físico real
+    true_L = (active_soc / 0.020) - 1.0 
     
     problem = ChargingAssignmentProblem(
         robot_ids=active_rids,
         station_ids=station_ids,
         nominal_cost=c_subset,
         deviation=d_subset,
-        travel_budget=infinite_budget, # Sem crashes!
+        travel_budget=infinite_budget, 
         residual_capacity=caps - load,
         current_load=load,
         total_capacity=caps,
@@ -358,6 +367,7 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
             ax.legend(loc='upper right')
             fig.tight_layout()
             fig.savefig(plots_dir / '3_micro_aco_convergence_stat.pdf')
+            fig.savefig(plots_dir / '3_micro_aco_convergence_stat.png')
             plt.close(fig)
 
     if pheromone_snapshots:
@@ -514,7 +524,7 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
         # if state[rid] == WORKING:
             tx, ty = positions[target_v]
             ax.scatter(tx, ty, s=20, marker='x', color='k', zorder=2, linewidth=1.2)
-            ax.text(tx, ty + 0.10, f'{rid}', color='k', fontsize=4.9, ha='center', fontweight='bold', zorder=2)
+            ax.text(tx, ty + 0.15, f'{rid}', color='k', fontsize=4.9, ha='center', fontweight='bold', zorder=2)
         
     for rid, coords in xy.items():
         x, y = coords
@@ -549,7 +559,7 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
         ax.scatter(x, y, s=300, marker='s', color=colors[sid], edgecolor='black', linewidth=1, zorder=7)
         cap = problem.total_capacity[j] if problem else "N/A"
         ax.text(
-            x, y + 0.35, f'{sid}\n{assigned_counts[sid]}/{cap}',
+            x, y + 0.45, f'{sid}\n{assigned_counts[sid]}/{cap}',
             ha='center', fontsize=7, fontweight='bold', color=colors[sid]
         )
         
@@ -568,16 +578,18 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--robots', type=int, default=15)
+    p.add_argument('--robots', type=int, default=20)
     p.add_argument('--stations', type=int, default=3)
     p.add_argument('--rows', type=int, default=8)
     p.add_argument('--cols', type=int, default=8)
     p.add_argument('--obstacle-prob', type=float, default=0.15)
-    p.add_argument('--battery-threshold', type=float, default=0.45)
+    
+    # BATERIA REVERTIDA PARA EXTRAÇÃO DO BOTTLENECK (Inanição provocada)
+    p.add_argument('--battery-threshold', type=float, default=0.35) 
     
     p.add_argument('--gamma-frac', type=float, default=0.80)
     p.add_argument('--dev-mult', type=float, default=1.5)
-    p.add_argument('--dev-base', type=float, default=15.0)
+    p.add_argument('--dev-base', type=float, default=10.0) # Margem base ajustada
     p.add_argument('--lookahead-weight', type=float, default=0.5)
     p.add_argument('--q-pheromone', type=float, default=200.0)
     
@@ -587,11 +599,11 @@ def main():
     p.add_argument('--output', default='fsm_animation')
     p.add_argument('--save-data', action='store_true', default=True)
     
-    p.add_argument('--aco-epochs', type=int, default=25)
-    p.add_argument('--ants', type=int, default=25)
-    p.add_argument('--max-time', type=float, default=0.25)
+    p.add_argument('--aco-epochs', type=int, default=50) # HEAVY DUTY Exploration
+    p.add_argument('--ants', type=int, default=50)       # HEAVY DUTY Exploration
+    p.add_argument('--max-time', type=float, default=1.0)
     p.add_argument('--capacity-margin', type=float, default=1.4)
-    p.add_argument('--chargers-per-station', type=int, default=1)
+    p.add_argument('--chargers-per-station', type=int, default=2)
     p.add_argument('--minimum-reachable', type=int, default=2)
     p.add_argument('--fps', type=float, default=2.0)
     p.add_argument('--save-mp4', action='store_true')
@@ -652,7 +664,7 @@ def main():
     
     time_limit = a.max_time if a.max_time > 0 else None
     
-    # ATUALIZAÇÃO DO OTIMIZADOR COM NOVA PENALIDADE
+    # ATUALIZAÇÃO DO OTIMIZADOR (Recuperado: Hard Penalty para extrair falhas evidentes no Fitness)
     class ResilientDynamicRobustACO(DynamicRobustACO):
         @staticmethod
         def evaluate(problem: ChargingAssignmentProblem, assignment: np.ndarray):
@@ -696,7 +708,7 @@ def main():
                     
                     total_expected_time = problem.nominal_cost[i, j] + problem.deviation[i, j] + wait
                     if total_expected_time > true_budget[i]:
-                        # O D-ACO não crasha. Tenta escolher o mal menor.
+                        # A parede letal do Fitness (Para extrair o gráfico 3 explodido de propósito)
                         starvation_penalty += 1000.0 * (total_expected_time - true_budget[i])
 
             utilization = total_load / problem.total_capacity
@@ -749,7 +761,7 @@ def main():
                     
         for r in robot_ids:
             if state[r] == WORKING:
-                soc[r] -= rng.uniform(0.03, 0.06)
+                soc[r] -= rng.uniform(0.015, 0.035) 
                 if soc[r] < a.battery_threshold:
                     state[r] = HEADING
             elif state[r] == HEADING:
