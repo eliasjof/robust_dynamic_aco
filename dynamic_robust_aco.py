@@ -114,11 +114,7 @@ class ACOResult:
 
 
 class DynamicRobustACO(_MealpyOptimizer):
-    """Dynamic ACO for robust, capacitated robot-to-charger assignment.
-
-    Parameters follow common ACO notation. ``pop_size`` is the number of ants
-    and ``epoch`` is the number of colony iterations per decision epoch.
-    """
+    """Dynamic ACO for robust, capacitated robot-to-charger assignment."""
 
     def __init__(
         self,
@@ -172,7 +168,7 @@ class DynamicRobustACO(_MealpyOptimizer):
         self.history_hamming: List[float] = []
         self.history_pheromone_entropy: List[float] = []
         self.history_tau_ratio: List[float] = []
-        self.history_iter: Dict[str, List[float]] = {}
+        self.history_iter: Dict[str, List[any]] = {}
         self.g_best: Optional[ACOResult] = None
 
     def reset_memory(self) -> None:
@@ -268,8 +264,8 @@ class DynamicRobustACO(_MealpyOptimizer):
                 queue_cost += queue_weight * max(0, absolute_position - int(chargers[j]))
                 waiting_cost += wait_weight * wait
         utilization = total_load / problem.total_capacity
-        barrier = utilization / (1.0 - utilization + problem.epsilon)
-        congestion = float(problem.congestion_weight * barrier.sum())
+        # Penalização quadrática suave em vez de barreira explosiva
+        congestion = float(problem.congestion_weight * np.sum(utilization ** 2))
         switching_count = 0
         for i, rid in enumerate(problem.robot_ids):
             previous = problem.previous_assignment.get(rid)
@@ -307,7 +303,8 @@ class DynamicRobustACO(_MealpyOptimizer):
                 for j in candidates:
                     projected_load = problem.current_load[j] + (problem.residual_capacity[j] - remaining[j]) + 1
                     u = projected_load / problem.total_capacity[j]
-                    delta_barrier = u / (1.0 - u + problem.epsilon)
+                    # Penalização quadrática suave para a heurística da formiga
+                    delta_barrier = u ** 2
                     switch = float(problem.previous_assignment.get(problem.robot_ids[i]) not in (None, problem.station_ids[j]))
                     guide = problem.nominal_cost[i, j] + gamma_fraction * problem.deviation[i, j]
                     guide += problem.congestion_weight * delta_barrier + problem.switching_weight * switch
@@ -335,7 +332,6 @@ class DynamicRobustACO(_MealpyOptimizer):
             self.pheromone[key] = min(self.tau_max, self.pheromone[key] + amount)
 
     def _pheromone_diagnostics(self, problem):
-        """Return mean normalized entropy and global max/min pheromone ratio."""
         entropies, all_values = [], []
         mask = problem.feasible_mask
         for i, robot_id in enumerate(problem.robot_ids):
@@ -374,7 +370,7 @@ class DynamicRobustACO(_MealpyOptimizer):
         best_assignment = baseline.copy()
         best_fitness, best_components = self.evaluate(problem, best_assignment)
         
-        self.history_iter = {'fitness_iter': [], 'pheromone_mean': []}
+        self.history_iter = {'fitness_iter': [], 'pheromone_mean': [], 'pheromone_matrix': []}
         self.history_best = [best_fitness]
         self.history_time = [0.0]
         self.history_fe = [1]
@@ -425,10 +421,12 @@ class DynamicRobustACO(_MealpyOptimizer):
                 self.history_diversity.append(0.0)
                 self.history_hamming.append(0.0)
             
-            # Adicionado para suportar os gráficos de convergência por iteração
             self.history_iter['fitness_iter'].append(float(best_fitness))
             mean_pher = float(np.mean(list(self.pheromone.values()))) if self.pheromone else 0.0
             self.history_iter['pheromone_mean'].append(mean_pher)
+            
+            # --- SALVA A MATRIZ DE FEROMONIO NESTA ITERAÇÃO ---
+            self.history_iter['pheromone_matrix'].append(dict(self.pheromone))
             
             entropy, tau_ratio = self._pheromone_diagnostics(problem)
             self.history_pheromone_entropy.append(entropy)

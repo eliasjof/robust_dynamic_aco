@@ -1,11 +1,11 @@
 """
 Animação de Enxame Robótico com Máquina de Estados Finita (FSM) e Extração Académica.
 REGRAS FÍSICAS RESTRITAS (COLISÃO ZERO E RETOMA DE TAREFAS):
+- Task-Aware Routing (Look-ahead): Otimização prevê a distância da recarga até a próxima tarefa.
+- Waypoints Únicos e Imediatos: Tarefas são renovadas (sem repetição) no exato instante da chegada.
 - Retoma de Tarefa: Robôs mantêm o seu waypoint original após recarregarem.
 - Colisão Zero Absoluta: Prevenção de nós ocupados e cruzamento em X (diagonais).
-- Incerteza Dinâmica: Escalas de Robustez e Gamma ajustáveis.
-- Normalização de Métricas: O custo nos gráficos é avaliado POR AGENTE ATIVO.
-- Micro-convergência: Plotagem de todas as curvas individuais do D-ACO.
+- Normalização e Exportação: Gráficos IEEE (Macro, Micro, Saúde e Heatmap Dual-Axis corrigido).
 """
 
 from __future__ import annotations
@@ -128,11 +128,15 @@ def build_cache_dijkstra(graph, stations_dict):
     return cache
 
 
-def make_cost_matrix_local(vertices_dict, station_ids, cache):
-    c_subset = np.zeros((len(vertices_dict), len(station_ids)))
-    for i, (rid, v) in enumerate(vertices_dict.items()):
+def make_cost_matrix_local(active_rids, active_vertices, station_ids, cache, working_targets, lookahead_weight):
+    c_subset = np.zeros((len(active_rids), len(station_ids)))
+    for i, rid in enumerate(active_rids):
+        current_v = active_vertices[rid]
+        target_v = working_targets[rid]
         for j, sid in enumerate(station_ids):
-            c_subset[i, j] = cache.get((v, sid), float('inf'))
+            dist_to_station = cache.get((current_v, sid), float('inf'))
+            dist_to_task = cache.get((target_v, sid), float('inf'))
+            c_subset[i, j] = dist_to_station + (lookahead_weight * dist_to_task)
     return c_subset
 
 
@@ -146,18 +150,14 @@ def ensure_k_station_reachability_local(c_subset, d_subset, proposed_L, k, slack
     return L
 
 
-# ============================================================================
-# LÓGICA DO FSM E OTIMIZAÇÃO
-# ============================================================================
-
-def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, caps, load, previous, min_reachable, chargers_per_station, gamma_frac, dev_mult, dev_base):
+def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, caps, load, previous, min_reachable, chargers_per_station, gamma_frac, dev_mult, dev_base, working_targets, lookahead_weight):
     if not active_rids:
         return None, 0
 
     active_soc = np.array([soc[r] for r in active_rids])
     active_vertices = {r: vertices[r] for r in active_rids}
     
-    c_subset = make_cost_matrix_local(active_vertices, station_ids, cache)
+    c_subset = make_cost_matrix_local(active_rids, active_vertices, station_ids, cache, working_targets, lookahead_weight)
     d_subset = dev_mult * c_subset + dev_base 
     
     proposed_L = 40.0 * active_soc - 2.0
@@ -276,7 +276,7 @@ def interpolate_positions(vertices, target, positions, fraction):
     return out
 
 
-def plot_academic_results(macro_metrics_df, aco_snapshots, out_dir):
+def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, internal_pheromone_snapshot, internal_target_epoch, out_dir):
     plt.rcParams.update({
         'font.family': 'serif',
         'axes.titlesize': 12,
@@ -327,33 +327,145 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, out_dir):
     plt.close(fig)
 
     if aco_snapshots:
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        cmap = plt.get_cmap('viridis')
-        keys = sorted(list(aco_snapshots.keys()))
-        
-        # Plotar todas as curvas com colormap
-        for idx, tk in enumerate(keys):
-            data = aco_snapshots[tk]
-            if 'fitness_iter' in data and len(data['fitness_iter']) > 0:
-                color = cmap(idx / max(1, len(keys) - 1))
-                ax.plot(range(len(data['fitness_iter'])), data['fitness_iter'], 
-                        color=color, alpha=0.7, linewidth=1.2)
-                
-        ax.set_xlabel('ACO Iteration (Internal)')
-        ax.set_ylabel('Normalized Best Fitness / Agent')
-        ax.set_title('Internal D-ACO Convergence Profile (All Epochs)')
-        ax.grid(True, linestyle=':', alpha=0.7)
-        
-        # Colorbar para indicar a passagem do tempo
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=min(keys), vmax=max(keys)))
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax)
-        cbar.set_label('Decision Epoch ($t_k$)')
-        
-        fig.tight_layout()
-        fig.savefig(plots_dir / '3_micro_aco_convergence_all.pdf')
-        fig.savefig(plots_dir / '3_micro_aco_convergence_all.png')
-        plt.close(fig)
+        all_curves = [data['fitness_iter'] for data in aco_snapshots.values() if len(data['fitness_iter']) > 0]
+        if all_curves:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            max_len = max(len(curve) for curve in all_curves)
+            
+            padded_curves = []
+            for curve in all_curves:
+                padded = list(curve)
+                if len(padded) > 0:
+                    last_val = padded[-1]
+                    while len(padded) < max_len:
+                        padded.append(last_val)
+                    padded_curves.append(padded)
+            
+            matrix = np.array(padded_curves)
+            mean_curve = np.mean(matrix, axis=0)
+            std_curve = np.std(matrix, axis=0)
+            iterations = np.arange(1, max_len + 1)
+            
+            ax.plot(iterations, mean_curve, color='#1f77b4', linewidth=2, label='Mean Normalized Fitness')
+            ax.fill_between(iterations, np.maximum(0, mean_curve - std_curve), mean_curve + std_curve, color='#1f77b4', alpha=0.2, label='±1 Standard Deviation')
+            ax.set_xlabel('ACO Iteration (Internal)')
+            ax.set_ylabel('Normalized Best Fitness / Agent')
+            ax.set_title('Internal D-ACO Convergence Profile (Statistical Aggregate)')
+            ax.grid(True, linestyle=':', alpha=0.7)
+            ax.legend(loc='upper right')
+            
+            fig.tight_layout()
+            fig.savefig(plots_dir / '3_micro_aco_convergence_stat.pdf')
+            fig.savefig(plots_dir / '3_micro_aco_convergence_stat.png')
+            plt.close(fig)
+
+    if pheromone_snapshots:
+        epochs = sorted(list(pheromone_snapshots.keys()))
+        all_keys = set()
+        for k in epochs:
+            all_keys.update(pheromone_snapshots[k].keys())
+            
+        if all_keys:
+            sorted_keys = sorted(list(all_keys), key=lambda x: (x[1], x[0]))
+            
+            P = np.zeros((len(sorted_keys), len(epochs)))
+            for j, k in enumerate(epochs):
+                for i, key in enumerate(sorted_keys):
+                    P[i, j] = pheromone_snapshots[k].get(key, 0.0) 
+                    
+            fig, ax = plt.subplots(figsize=(8, 6))
+            cax = ax.imshow(P, aspect='auto', cmap='magma', origin='lower')
+            
+            ax.set_xlabel('Decision Epoch ($t_k$)')
+            ax.set_title('Pheromone Matrix Evolution (Global Memory)')
+            
+            ax.set_yticks(np.arange(len(sorted_keys)))
+            ax.set_yticklabels([key[0] for key in sorted_keys], fontsize=7)
+            ax.set_ylabel('Robot ID', fontweight='bold')
+            
+            current_station = sorted_keys[0][1]
+            station_ticks = []
+            station_labels = []
+            block_start = 0
+            
+            for i, key in enumerate(sorted_keys):
+                if key[1] != current_station:
+                    ax.axhline(i - 0.5, color='white', linewidth=0.8, linestyle='--')
+                    station_ticks.append((block_start + i - 1) / 2.0)
+                    station_labels.append(current_station)
+                    current_station = key[1]
+                    block_start = i
+            
+            station_ticks.append((block_start + len(sorted_keys) - 1) / 2.0)
+            station_labels.append(current_station)
+            
+            ax2 = ax.twinx()
+            ax2.set_ylim(ax.get_ylim()) 
+            ax2.set_yticks(station_ticks)
+            ax2.set_yticklabels(station_labels, rotation=90, va='center', fontweight='bold', fontsize=9)
+            ax2.set_ylabel('Target Charging Station', fontweight='bold')
+            ax2.tick_params(axis='y', length=0) 
+            
+            # --- CORREÇÃO: Ancorar a barra de cores a AMBOS os eixos para não sobrepor o eixo da direita ---
+            fig.colorbar(cax, ax=[ax, ax2], label=r'Pheromone Concentration ($\tau_{ij}$)', pad=0.08)
+            
+            fig.savefig(plots_dir / '4_pheromone_heatmap_macro.pdf', bbox_inches='tight')
+            fig.savefig(plots_dir / '4_pheromone_heatmap_macro.png', bbox_inches='tight')
+            plt.close(fig)
+
+    if internal_pheromone_snapshot:
+        iterations_count = len(internal_pheromone_snapshot)
+        all_keys = set()
+        for p_dict in internal_pheromone_snapshot:
+            all_keys.update(p_dict.keys())
+            
+        if all_keys:
+            sorted_keys = sorted(list(all_keys), key=lambda x: (x[1], x[0]))
+            
+            P = np.zeros((len(sorted_keys), iterations_count))
+            for j, p_dict in enumerate(internal_pheromone_snapshot):
+                for i, key in enumerate(sorted_keys):
+                    P[i, j] = p_dict.get(key, 0.0) 
+                    
+            fig, ax = plt.subplots(figsize=(8, 6))
+            cax = ax.imshow(P, aspect='auto', cmap='magma', origin='lower')
+            
+            ax.set_xlabel('ACO Internal Iteration')
+            ax.set_title(f'Pheromone Matrix Evolution (Inside Epoch $t_{{{internal_target_epoch}}}$)')
+            
+            ax.set_yticks(np.arange(len(sorted_keys)))
+            ax.set_yticklabels([key[0] for key in sorted_keys], fontsize=7)
+            ax.set_ylabel('Robot ID', fontweight='bold')
+            
+            current_station = sorted_keys[0][1]
+            station_ticks = []
+            station_labels = []
+            block_start = 0
+            
+            for i, key in enumerate(sorted_keys):
+                if key[1] != current_station:
+                    ax.axhline(i - 0.5, color='white', linewidth=0.8, linestyle='--')
+                    station_ticks.append((block_start + i - 1) / 2.0)
+                    station_labels.append(current_station)
+                    current_station = key[1]
+                    block_start = i
+            
+            station_ticks.append((block_start + len(sorted_keys) - 1) / 2.0)
+            station_labels.append(current_station)
+            
+            ax2 = ax.twinx()
+            ax2.set_ylim(ax.get_ylim()) 
+            ax2.set_yticks(station_ticks)
+            ax2.set_yticklabels(station_labels, rotation=90, va='center', fontweight='bold', fontsize=9)
+            ax2.set_ylabel('Target Charging Station', fontweight='bold')
+            ax2.tick_params(axis='y', length=0) 
+            
+            # --- CORREÇÃO DA ESCALA ---
+            fig.colorbar(cax, ax=[ax, ax2], label=r'Pheromone Concentration ($\tau_{ij}$)', pad=0.08)
+            
+            fig.savefig(plots_dir / f'5_pheromone_heatmap_micro_t{internal_target_epoch}.pdf', bbox_inches='tight')
+            fig.savefig(plots_dir / f'5_pheromone_heatmap_micro_t{internal_target_epoch}.png', bbox_inches='tight')
+            plt.close(fig)
 
 
 def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, xy, soc, state, problem, result, previous, working_targets, label_fontsize=5.6):
@@ -374,17 +486,17 @@ def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, 
         changed = {r for r, s in result.assignment.items() if previous and previous.get(r) != s}
         
     for rid, target_v in working_targets.items():
-        if state[rid] == WORKING:
+        # if state[rid] == WORKING:
             tx, ty = positions[target_v]
-            ax.scatter(tx, ty, s=30, marker='d', color='#888888', zorder=2, linewidth=1.2)
-            ax.text(tx, ty + 0.20, f'{rid}', color='#555555', fontsize=4.2, ha='center', fontweight='bold', zorder=2)
+            ax.scatter(tx, ty, s=20, marker='x', color='k', zorder=2, linewidth=1.2)
+            ax.text(tx, ty + 0.10, f'{rid}', color='k', fontsize=4.9, ha='center', fontweight='bold', zorder=2)
         
     for rid, coords in xy.items():
         x, y = coords
         robot_soc = soc[rid]
         robot_state = state[rid]
         
-        marker_size = 120  
+        marker_size = 60  
         
         if robot_state == WORKING:
             color = '#999999'
@@ -438,9 +550,10 @@ def main():
     p.add_argument('--obstacle-prob', type=float, default=0.15)
     p.add_argument('--battery-threshold', type=float, default=0.35)
     
-    p.add_argument('--gamma-frac', type=float, default=0.60, help='Percentagem da frota a imunizar contra atrasos')
-    p.add_argument('--dev-mult', type=float, default=5.0, help='Multiplicador de incerteza por distância percorrida')
-    p.add_argument('--dev-base', type=float, default=2.0, help='Incerteza/atraso fixo mínimo de qualquer viagem')
+    p.add_argument('--gamma-frac', type=float, default=0.60)
+    p.add_argument('--dev-mult', type=float, default=5.0)
+    p.add_argument('--dev-base', type=float, default=2.0)
+    p.add_argument('--lookahead-weight', type=float, default=0.5)
     
     p.add_argument('--epochs', type=int, default=60)
     p.add_argument('--frames-per-epoch', type=int, default=5)
@@ -457,6 +570,8 @@ def main():
     p.add_argument('--fps', type=float, default=2.0)
     p.add_argument('--save-mp4', action='store_true')
     p.add_argument('--ffmpeg', default='ffmpeg')
+    
+    p.add_argument('--internal-heatmap-epoch', type=int, default=-1, help='Epoch tk to plot internal pheromone evolution')
 
     a = p.parse_args()
     out = Path(a.output)
@@ -503,30 +618,40 @@ def main():
     soc = {r: rng.uniform(a.battery_threshold, 1.0) for r in robot_ids}
     state = {r: WORKING for r in robot_ids}
     
-    working_targets = {r: int(rng.choice(working_node_pool)) for r in robot_ids}
+    chosen_initial = rng.choice(working_node_pool, size=a.robots, replace=False)
+    working_targets = {rid: int(target) for rid, target in zip(robot_ids, chosen_initial)}
     
     base_cap = np.full(a.stations, np.ceil((a.robots / a.stations) * a.capacity_margin))
     caps = base_cap.astype(int)
-
-    # Tratamento para ignorar o tempo limite se max_time for negativo
+    
     time_limit = a.max_time if a.max_time > 0 else None
     
     model = DynamicRobustACO(
         epoch=a.aco_epochs, pop_size=a.ants, heuristic_power=2.5,
-        evaporation=0.2, forgetting=0.15, q_pheromone=8, max_time=a.max_time
+        evaporation=0.2, forgetting=0.15, q_pheromone=8, max_time=time_limit
     )
     
     previous_assignment = {}
     paths = []
-
-
-
     frame = 0
     
     macro_data = []
     aco_snapshots = {}
+    pheromone_snapshots = {}
+    internal_pheromone_snapshot = None 
     
     for k in range(a.epochs):
+        
+        for r in robot_ids:
+            if state[r] == WORKING and vertices[r] == working_targets[r]:
+                occupied_targets = set(working_targets.values())
+                available_targets = [n for n in working_node_pool if n not in occupied_targets]
+                
+                if available_targets:
+                    working_targets[r] = int(rng.choice(available_targets))
+                else:
+                    working_targets[r] = int(rng.choice(working_node_pool))
+                    
         for r in robot_ids:
             if state[r] == WORKING:
                 soc[r] -= rng.uniform(0.06, 0.12)
@@ -558,17 +683,13 @@ def main():
                     state[r] = WORKING
                     if r in previous_assignment: del previous_assignment[r]
 
-        for r in robot_ids:
-            if state[r] == WORKING and vertices[r] == working_targets[r]:
-                working_targets[r] = int(rng.choice(working_node_pool))
-
         active_rids = [r for r in robot_ids if state[r] in (HEADING, WAITING, PLUGGED_IN)]
         load = np.zeros(a.stations, dtype=int)
         
         problem, kused = build_subset_problem(
             model, active_rids, station_ids, vertices, cache,
             soc, caps, load, previous_assignment, a.minimum_reachable, a.chargers_per_station,
-            a.gamma_frac, a.dev_mult, a.dev_base
+            a.gamma_frac, a.dev_mult, a.dev_base, working_targets, a.lookahead_weight
         )
         
         result = None
@@ -588,13 +709,17 @@ def main():
                 'switches': result.components.get('switch_count', 0)
             })
             
-            # --- CORREÇÃO: Capturar a convergência EM TODAS AS ÉPOCAS com agentes ativos ---
             if num_active > 0 and hasattr(model, 'history_iter'):
                 raw_fitness_iter = model.history_iter.get('fitness_iter', [])
                 norm_fitness_iter = [fit / num_active for fit in raw_fitness_iter]
                 aco_snapshots[k] = {
                     'fitness_iter': norm_fitness_iter
                 }
+                
+                if k == a.internal_heatmap_epoch:
+                    internal_pheromone_snapshot = list(model.history_iter.get('pheromone_matrix', []))
+            
+            pheromone_snapshots[k] = dict(model.pheromone)
             
             for r in active_rids:
                 if state[r] in (WAITING, PLUGGED_IN):
@@ -643,13 +768,54 @@ def main():
         
     print(f'Geração concluída. Guardados {len(paths)} frames em {out}')
     
-    if a.save_data and len(macro_data) > 0:
-        print("\n📈 A processar métricas e gerar gráficos...")
-        df_macro = pd.DataFrame(macro_data)
+    if a.save_data:
         data_dir = out / 'results_data'
         data_dir.mkdir(exist_ok=True)
-        df_macro.to_csv(data_dir / 'macro_metrics_evolution.csv', index=False)
-        plot_academic_results(df_macro, aco_snapshots, out)
+        
+        if len(macro_data) > 0:
+            print("\n📈 A exportar métricas e gerar gráficos académicos...")
+            df_macro = pd.DataFrame(macro_data)
+            df_macro.to_csv(data_dir / 'macro_metrics_evolution.csv', index=False)
+            plot_academic_results(df_macro, aco_snapshots, pheromone_snapshots, internal_pheromone_snapshot, a.internal_heatmap_epoch, out)
+
+        if aco_snapshots:
+            print("💾 A exportar CSV da Micro-convergência...")
+            micro_records = []
+            for tk, data in aco_snapshots.items():
+                for it_idx, fit_val in enumerate(data['fitness_iter']):
+                    micro_records.append({
+                        'epoch_tk': tk,
+                        'iteration': it_idx + 1,
+                        'normalized_fitness': fit_val
+                    })
+            pd.DataFrame(micro_records).to_csv(data_dir / 'micro_convergence_evolution.csv', index=False)
+
+        if pheromone_snapshots:
+            print("💾 A exportar CSV do Heatmap de Feromônio Macro...")
+            pher_records = []
+            epochs_list = sorted(list(pheromone_snapshots.keys()))
+            for tk in epochs_list:
+                for key, val in pheromone_snapshots[tk].items():
+                    pher_records.append({
+                        'epoch_tk': tk,
+                        'robot_id': key[0],
+                        'station_id': key[1],
+                        'pheromone_val': val
+                    })
+            pd.DataFrame(pher_records).to_csv(data_dir / 'pheromone_evolution_macro.csv', index=False)
+            
+        if internal_pheromone_snapshot:
+            print(f"💾 A exportar CSV do Heatmap de Feromônio Micro (Época {a.internal_heatmap_epoch})...")
+            micro_pher_records = []
+            for it_idx, p_dict in enumerate(internal_pheromone_snapshot):
+                for key, val in p_dict.items():
+                    micro_pher_records.append({
+                        'internal_iteration': it_idx + 1,
+                        'robot_id': key[0],
+                        'station_id': key[1],
+                        'pheromone_val': val
+                    })
+            pd.DataFrame(micro_pher_records).to_csv(data_dir / f'pheromone_evolution_micro_t{a.internal_heatmap_epoch}.csv', index=False)
 
     images = [Image.open(x).convert('RGB') for x in paths]
     duration = int(round(1000 / a.fps))
