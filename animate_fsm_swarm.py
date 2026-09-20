@@ -1,11 +1,11 @@
 """
 Animação de Enxame Robótico com Máquina de Estados Finita (FSM) e Extração Académica.
-REGRAS FÍSICAS RESTRITAS (COLISÃO ZERO E RETOMA DE TAREFAS):
+REGRAS FÍSICAS RESTRITAS:
 - Task-Aware Routing (Look-ahead): Otimização prevê a distância da recarga até a próxima tarefa.
-- Waypoints Únicos e Imediatos: Tarefas são renovadas (sem repetição) no exato instante da chegada.
-- Retoma de Tarefa: Robôs mantêm o seu waypoint original após recarregarem.
+- Soft Constraint: Prevenção de Crashes. O D-ACO penaliza a inanição mas não aborta a simulação.
+- Envelope de Bertsimas-Sim: Cronometragem com Acoplamento de Perímetro (-1 hop).
+- Normalização de Probabilidade: Heatmaps exibem a % de Confiança do D-ACO.
 - Colisão Zero Absoluta: Prevenção de nós ocupados e cruzamento em X (diagonais).
-- Normalização e Exportação: Gráficos IEEE (Macro, Micro, Saúde e Heatmap Dual-Axis corrigido).
 """
 
 from __future__ import annotations
@@ -106,13 +106,16 @@ def create_custom_grid_graph(rows, cols, num_stations, obstacle_prob=0.15, seed=
     return graph, edges, final_pos, obstacle_coords, station_nodes
 
 
-def build_cache_dijkstra(graph, stations_dict):
-    cache = {}
+def build_dual_cache(graph, stations_dict):
+    cache_dist = {}
+    cache_hops = {}
     for sid, start_v in stations_dict.items():
         dist = {v: float('inf') for v in graph}
+        hops = {v: float('inf') for v in graph}
         dist[start_v] = 0.0
-        pq = [(0.0, start_v)]
+        hops[start_v] = 0.0
         
+        pq = [(0.0, start_v)]
         while pq:
             d, curr = heapq.heappop(pq)
             if d > dist[curr]:
@@ -123,75 +126,74 @@ def build_cache_dijkstra(graph, stations_dict):
                     dist[nxt] = new_d
                     heapq.heappush(pq, (new_d, nxt))
                     
-        for v, d in dist.items():
-            cache[(v, sid)] = d
-    return cache
+        q = [start_v]
+        visited = {start_v}
+        while q:
+            curr = q.pop(0)
+            for nxt, _ in graph[curr]:
+                if nxt not in visited:
+                    visited.add(nxt)
+                    hops[nxt] = hops[curr] + 1.0
+                    q.append(nxt)
+                    
+        for v in graph:
+            cache_dist[(v, sid)] = dist[v]
+            cache_hops[(v, sid)] = hops[v]
+            
+    return cache_dist, cache_hops
 
 
-def make_cost_matrix_local(active_rids, active_vertices, station_ids, cache, working_targets, lookahead_weight):
+def make_cost_matrix_local(active_rids, active_vertices, station_ids, cache_dist, working_targets, lookahead_weight):
     c_subset = np.zeros((len(active_rids), len(station_ids)))
     for i, rid in enumerate(active_rids):
         current_v = active_vertices[rid]
         target_v = working_targets[rid]
         for j, sid in enumerate(station_ids):
-            dist_to_station = cache.get((current_v, sid), float('inf'))
-            dist_to_task = cache.get((target_v, sid), float('inf'))
+            dist_to_station = cache_dist.get((current_v, sid), float('inf'))
+            dist_to_task = cache_dist.get((target_v, sid), float('inf'))
             c_subset[i, j] = dist_to_station + (lookahead_weight * dist_to_task)
     return c_subset
 
 
-def ensure_k_station_reachability_local(c_subset, d_subset, proposed_L, k, slack=0.50):
-    L = proposed_L.copy()
-    req = c_subset + d_subset
-    for i in range(len(L)):
-        sorted_req = np.sort(req[i])
-        if k <= len(sorted_req):
-            L[i] = max(L[i], sorted_req[k - 1] + slack)
-    return L
-
-
-def build_subset_problem(model, active_rids, station_ids, vertices, cache, soc, caps, load, previous, min_reachable, chargers_per_station, gamma_frac, dev_mult, dev_base, working_targets, lookahead_weight):
+def build_subset_problem(model, active_rids, station_ids, vertices, cache_dist, soc, caps, load, previous, min_reachable, chargers_per_station, gamma_frac, dev_mult, dev_base, working_targets, lookahead_weight):
     if not active_rids:
         return None, 0
 
     active_soc = np.array([soc[r] for r in active_rids])
     active_vertices = {r: vertices[r] for r in active_rids}
     
-    c_subset = make_cost_matrix_local(active_rids, active_vertices, station_ids, cache, working_targets, lookahead_weight)
+    c_subset = make_cost_matrix_local(active_rids, active_vertices, station_ids, cache_dist, working_targets, lookahead_weight)
     d_subset = dev_mult * c_subset + dev_base 
     
-    proposed_L = 40.0 * active_soc - 2.0
-    first_k = min(max(1, min_reachable), len(station_ids))
+    # ATUALIZAÇÃO: Para impedir o CRASH da simulação, damos um orçamento matemático infinito
+    # para a filtragem inicial. O custo letal será cobrado na função evaluate do ACO!
+    infinite_budget = np.full(len(active_rids), np.inf)
+    true_L = (active_soc / 0.020) - 1.0 # O orçamento físico real
     
-    last_problem = None
-    for k in range(first_k, len(station_ids) + 1):
-        L = ensure_k_station_reachability_local(c_subset, d_subset, proposed_L, k, slack=0.50)
-        
-        problem = ChargingAssignmentProblem(
-            robot_ids=active_rids,
-            station_ids=station_ids,
-            nominal_cost=c_subset,
-            deviation=d_subset,
-            travel_budget=L,
-            residual_capacity=caps - load,
-            current_load=load,
-            total_capacity=caps,
-            previous_assignment=previous,
-            gamma=gamma_frac * len(active_rids),
-            congestion_weight=25.0,
-            switching_weight=10.0,
-            epsilon=0.05
-        )
-        problem.charger_capacity = np.full(len(station_ids), chargers_per_station)
-        last_problem = problem
-        
-        if model._maximum_b_matching(problem) is not None:
-            return problem, k
-            
-    raise RuntimeError("O subconjunto de robôs não possui rotas viáveis. Tente aumentar a margem de capacidade (--capacity-margin).")
+    problem = ChargingAssignmentProblem(
+        robot_ids=active_rids,
+        station_ids=station_ids,
+        nominal_cost=c_subset,
+        deviation=d_subset,
+        travel_budget=infinite_budget, # Sem crashes!
+        residual_capacity=caps - load,
+        current_load=load,
+        total_capacity=caps,
+        previous_assignment=previous,
+        gamma=gamma_frac * len(active_rids),
+        congestion_weight=25.0,
+        switching_weight=10.0,
+        epsilon=0.05
+    )
+    problem.charger_capacity = np.full(len(station_ids), chargers_per_station)
+    problem.charging_time = np.full(len(station_ids), 5.0) 
+    problem.soc = active_soc
+    problem.true_budget = true_L
+    
+    return problem, len(station_ids)
 
 
-def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng, working_targets, pos, blocked, station_centers, dynamic_edges, cols):
+def get_next_step(rid, current_v, state, assignment, graph, cache_dist, stations, rng, working_targets, pos, blocked, station_centers, dynamic_edges, cols):
     def valid_edge(u, v):
         if v in blocked: 
             return False
@@ -211,14 +213,14 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
         if current_v == station_v: return current_v
         choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and (u not in station_centers or u == station_v)]
         if not choices: return current_v
-        return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
+        return min(choices, key=lambda n: cache_dist.get((n, sid), float('inf')))
 
     elif state[rid] == WAITING:
         sid = assignment.get(rid)
         if current_v not in station_centers: return current_v
         choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
         if not choices: return current_v
-        if sid: return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
+        if sid: return min(choices, key=lambda n: cache_dist.get((n, sid), float('inf')))
         return rng.choice(choices)
 
     elif state[rid] == HEADING:
@@ -227,7 +229,7 @@ def get_next_step(rid, current_v, state, assignment, graph, cache, stations, rng
         choices = [u for u, _ in graph[current_v] if valid_edge(current_v, u) and u not in station_centers]
         if current_v not in station_centers: choices.append(current_v)
         if not choices: return current_v
-        return min(choices, key=lambda n: cache.get((n, sid), float('inf')))
+        return min(choices, key=lambda n: cache_dist.get((n, sid), float('inf')))
         
     elif state[rid] == WORKING:
         target_v = working_targets[rid]
@@ -276,7 +278,7 @@ def interpolate_positions(vertices, target, positions, fraction):
     return out
 
 
-def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, internal_pheromone_snapshot, internal_target_epoch, out_dir):
+def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, internal_pheromone_snapshot, internal_target_epoch, trip_records, out_dir):
     plt.rcParams.update({
         'font.family': 'serif',
         'axes.titlesize': 12,
@@ -301,25 +303,29 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
     ax1.legend(loc='upper right')
     fig.tight_layout()
     fig.savefig(plots_dir / '1_macro_convergence.pdf')
-    fig.savefig(plots_dir / '1_macro_convergence.png')
     plt.close(fig)
 
     fig, ax1 = plt.subplots(figsize=(7, 4.5))
-    color = 'tab:green'
     ax1.set_xlabel('Decision Epoch ($t_k$)')
-    ax1.set_ylabel('Average Swarm SoC (%)', color=color)
-    ax1.plot(macro_metrics_df['epoch'], macro_metrics_df['avg_soc'] * 100, color=color, linewidth=2)
-    ax1.tick_params(axis='y', labelcolor=color)
-    ax1.set_ylim(0, 100)
+    ax1.set_ylabel('Swarm SoC (%)', color='black')
+    
+    ln1 = ax1.plot(macro_metrics_df['epoch'], macro_metrics_df['avg_soc'] * 100, color='tab:green', linewidth=2, label='Average Swarm SoC')
+    ln2 = ax1.plot(macro_metrics_df['epoch'], macro_metrics_df['min_soc'] * 100, color='tab:orange', linewidth=1.5, linestyle='-.', label='Minimum Swarm SoC')
+    
+    ax1.tick_params(axis='y', labelcolor='black')
+    ax1.set_ylim(-5, 105)
     ax1.grid(True, linestyle=':', alpha=0.7)
     
     ax2 = ax1.twinx()  
-    color = 'tab:purple'
-    ax2.set_ylabel('Active D-ACO Agents', color=color)  
-    ax2.step(macro_metrics_df['epoch'], macro_metrics_df['active_agents'], color=color, linestyle='--', linewidth=1.5)
-    ax2.tick_params(axis='y', labelcolor=color)
+    ln3 = ax2.step(macro_metrics_df['epoch'], macro_metrics_df['active_agents'], color='tab:purple', linestyle='--', linewidth=1.5, label='Active D-ACO Agents')
+    ax2.set_ylabel('Active D-ACO Agents', color='tab:purple')  
+    ax2.tick_params(axis='y', labelcolor='tab:purple')
     ax2.set_ylim(0, max(macro_metrics_df['active_agents']) + 2)
-
+    
+    lns = ln1 + ln2 + ln3
+    labs = [l.get_label() for l in lns]
+    ax1.legend(lns, labs, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3)
+    
     plt.title('Swarm Energetic Health and Workload')
     fig.tight_layout()
     fig.savefig(plots_dir / '2_swarm_health.pdf')
@@ -331,7 +337,6 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
         if all_curves:
             fig, ax = plt.subplots(figsize=(7, 4.5))
             max_len = max(len(curve) for curve in all_curves)
-            
             padded_curves = []
             for curve in all_curves:
                 padded = list(curve)
@@ -340,12 +345,10 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
                     while len(padded) < max_len:
                         padded.append(last_val)
                     padded_curves.append(padded)
-            
             matrix = np.array(padded_curves)
             mean_curve = np.mean(matrix, axis=0)
             std_curve = np.std(matrix, axis=0)
             iterations = np.arange(1, max_len + 1)
-            
             ax.plot(iterations, mean_curve, color='#1f77b4', linewidth=2, label='Mean Normalized Fitness')
             ax.fill_between(iterations, np.maximum(0, mean_curve - std_curve), mean_curve + std_curve, color='#1f77b4', alpha=0.2, label='±1 Standard Deviation')
             ax.set_xlabel('ACO Iteration (Internal)')
@@ -353,10 +356,8 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
             ax.set_title('Internal D-ACO Convergence Profile (Statistical Aggregate)')
             ax.grid(True, linestyle=':', alpha=0.7)
             ax.legend(loc='upper right')
-            
             fig.tight_layout()
             fig.savefig(plots_dir / '3_micro_aco_convergence_stat.pdf')
-            fig.savefig(plots_dir / '3_micro_aco_convergence_stat.png')
             plt.close(fig)
 
     if pheromone_snapshots:
@@ -364,21 +365,25 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
         all_keys = set()
         for k in epochs:
             all_keys.update(pheromone_snapshots[k].keys())
-            
         if all_keys:
             sorted_keys = sorted(list(all_keys), key=lambda x: (x[1], x[0]))
-            
             P = np.zeros((len(sorted_keys), len(epochs)))
             for j, k in enumerate(epochs):
+                robot_totals = {}
+                for key in sorted_keys:
+                    rid = key[0]
+                    robot_totals[rid] = robot_totals.get(rid, 0.0) + pheromone_snapshots[k].get(key, 0.0)
                 for i, key in enumerate(sorted_keys):
-                    P[i, j] = pheromone_snapshots[k].get(key, 0.0) 
-                    
-            fig, ax = plt.subplots(figsize=(8, 6))
-            cax = ax.imshow(P, aspect='auto', cmap='magma', origin='lower')
+                    rid = key[0]
+                    if robot_totals[rid] > 1e-9:
+                        P[i, j] = pheromone_snapshots[k].get(key, 0.0) / robot_totals[rid]
+                    else:
+                        P[i, j] = 0.0
             
+            fig, ax = plt.subplots(figsize=(8.5, 6))
+            cax = ax.imshow(P, aspect='auto', cmap='magma', origin='lower', vmin=0.0, vmax=1.0)
             ax.set_xlabel('Decision Epoch ($t_k$)')
-            ax.set_title('Pheromone Matrix Evolution (Global Memory)')
-            
+            ax.set_title('Pheromone Matrix Evolution (Selection Probability)')
             ax.set_yticks(np.arange(len(sorted_keys)))
             ax.set_yticklabels([key[0] for key in sorted_keys], fontsize=7)
             ax.set_ylabel('Robot ID', fontweight='bold')
@@ -387,7 +392,6 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
             station_ticks = []
             station_labels = []
             block_start = 0
-            
             for i, key in enumerate(sorted_keys):
                 if key[1] != current_station:
                     ax.axhline(i - 0.5, color='white', linewidth=0.8, linestyle='--')
@@ -395,7 +399,6 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
                     station_labels.append(current_station)
                     current_station = key[1]
                     block_start = i
-            
             station_ticks.append((block_start + len(sorted_keys) - 1) / 2.0)
             station_labels.append(current_station)
             
@@ -406,9 +409,9 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
             ax2.set_ylabel('Target Charging Station', fontweight='bold')
             ax2.tick_params(axis='y', length=0) 
             
-            # --- CORREÇÃO: Ancorar a barra de cores a AMBOS os eixos para não sobrepor o eixo da direita ---
-            fig.colorbar(cax, ax=[ax, ax2], label=r'Pheromone Concentration ($\tau_{ij}$)', pad=0.08)
-            
+            fig.tight_layout(rect=[0, 0, 0.85, 1])
+            cbar_ax = fig.add_axes([0.88, 0.12, 0.03, 0.76])
+            fig.colorbar(cax, cax=cbar_ax, label=r'Relative Confidence / Probability')
             fig.savefig(plots_dir / '4_pheromone_heatmap_macro.pdf', bbox_inches='tight')
             fig.savefig(plots_dir / '4_pheromone_heatmap_macro.png', bbox_inches='tight')
             plt.close(fig)
@@ -418,21 +421,25 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
         all_keys = set()
         for p_dict in internal_pheromone_snapshot:
             all_keys.update(p_dict.keys())
-            
         if all_keys:
             sorted_keys = sorted(list(all_keys), key=lambda x: (x[1], x[0]))
-            
             P = np.zeros((len(sorted_keys), iterations_count))
             for j, p_dict in enumerate(internal_pheromone_snapshot):
+                robot_totals = {}
+                for key in sorted_keys:
+                    rid = key[0]
+                    robot_totals[rid] = robot_totals.get(rid, 0.0) + p_dict.get(key, 0.0)
                 for i, key in enumerate(sorted_keys):
-                    P[i, j] = p_dict.get(key, 0.0) 
-                    
-            fig, ax = plt.subplots(figsize=(8, 6))
-            cax = ax.imshow(P, aspect='auto', cmap='magma', origin='lower')
-            
+                    rid = key[0]
+                    if robot_totals[rid] > 1e-9:
+                        P[i, j] = p_dict.get(key, 0.0) / robot_totals[rid]
+                    else:
+                        P[i, j] = 0.0
+                        
+            fig, ax = plt.subplots(figsize=(8.5, 6))
+            cax = ax.imshow(P, aspect='auto', cmap='magma', origin='lower', vmin=0.0, vmax=1.0)
             ax.set_xlabel('ACO Internal Iteration')
-            ax.set_title(f'Pheromone Matrix Evolution (Inside Epoch $t_{{{internal_target_epoch}}}$)')
-            
+            ax.set_title(f'Decision Probability Evolution (Inside Epoch $t_{{{internal_target_epoch}}}$)')
             ax.set_yticks(np.arange(len(sorted_keys)))
             ax.set_yticklabels([key[0] for key in sorted_keys], fontsize=7)
             ax.set_ylabel('Robot ID', fontweight='bold')
@@ -441,7 +448,6 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
             station_ticks = []
             station_labels = []
             block_start = 0
-            
             for i, key in enumerate(sorted_keys):
                 if key[1] != current_station:
                     ax.axhline(i - 0.5, color='white', linewidth=0.8, linestyle='--')
@@ -449,7 +455,6 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
                     station_labels.append(current_station)
                     current_station = key[1]
                     block_start = i
-            
             station_ticks.append((block_start + len(sorted_keys) - 1) / 2.0)
             station_labels.append(current_station)
             
@@ -460,12 +465,32 @@ def plot_academic_results(macro_metrics_df, aco_snapshots, pheromone_snapshots, 
             ax2.set_ylabel('Target Charging Station', fontweight='bold')
             ax2.tick_params(axis='y', length=0) 
             
-            # --- CORREÇÃO DA ESCALA ---
-            fig.colorbar(cax, ax=[ax, ax2], label=r'Pheromone Concentration ($\tau_{ij}$)', pad=0.08)
-            
+            fig.tight_layout(rect=[0, 0, 0.85, 1])
+            cbar_ax = fig.add_axes([0.88, 0.12, 0.03, 0.76])
+            fig.colorbar(cax, cax=cbar_ax, label=r'Relative Confidence / Probability')
             fig.savefig(plots_dir / f'5_pheromone_heatmap_micro_t{internal_target_epoch}.pdf', bbox_inches='tight')
             fig.savefig(plots_dir / f'5_pheromone_heatmap_micro_t{internal_target_epoch}.png', bbox_inches='tight')
             plt.close(fig)
+
+    if len(trip_records) > 0:
+        trip_df = pd.DataFrame(trip_records).sort_values(by='nominal_hops').reset_index(drop=True)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        
+        ax.fill_between(trip_df.index, trip_df['nominal_hops'], trip_df['robust_hops'], color='#ff9999', alpha=0.3, label='Safety Margin ($\Gamma$)')
+        ax.plot(trip_df.index, trip_df['robust_hops'], color='tab:red', linestyle='-', linewidth=2, label='Robust Bound (Bertsimas-Sim)')
+        ax.plot(trip_df.index, trip_df['nominal_hops'], color='tab:blue', linestyle='--', linewidth=2, label='Nominal Time Expectation (Perimeter Hops)')
+        ax.scatter(trip_df.index, trip_df['real_epochs'], color='black', marker='x', s=25, alpha=0.8, label='Real Tracked Delay', zorder=4)
+        
+        ax.set_xlabel('Recharge Mission Index (Sorted by Nominal Time)')
+        ax.set_ylabel('Mission Duration (Decision Epochs / Time Steps)')
+        ax.set_title('Uncertainty Envelope: Expected vs. Realized Mission Costs')
+        ax.grid(True, linestyle=':', alpha=0.7)
+        ax.legend(loc='upper left')
+        
+        fig.tight_layout()
+        fig.savefig(plots_dir / '6_robust_survival_envelope.pdf')
+        fig.savefig(plots_dir / '6_robust_survival_envelope.png')
+        plt.close(fig)
 
 
 def render_fsm(path, epoch, phase, edges, positions, obstacle_coords, stations, xy, soc, state, problem, result, previous, working_targets, label_fontsize=5.6):
@@ -548,18 +573,19 @@ def main():
     p.add_argument('--rows', type=int, default=8)
     p.add_argument('--cols', type=int, default=8)
     p.add_argument('--obstacle-prob', type=float, default=0.15)
-    p.add_argument('--battery-threshold', type=float, default=0.35)
+    p.add_argument('--battery-threshold', type=float, default=0.45)
     
-    p.add_argument('--gamma-frac', type=float, default=0.60)
-    p.add_argument('--dev-mult', type=float, default=5.0)
-    p.add_argument('--dev-base', type=float, default=2.0)
+    p.add_argument('--gamma-frac', type=float, default=0.80)
+    p.add_argument('--dev-mult', type=float, default=1.5)
+    p.add_argument('--dev-base', type=float, default=15.0)
     p.add_argument('--lookahead-weight', type=float, default=0.5)
+    p.add_argument('--q-pheromone', type=float, default=200.0)
     
     p.add_argument('--epochs', type=int, default=60)
     p.add_argument('--frames-per-epoch', type=int, default=5)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--output', default='fsm_animation')
-    p.add_argument('--save-data', action='store_true', default=True, help="Gravar CSV e Gráficos")
+    p.add_argument('--save-data', action='store_true', default=True)
     
     p.add_argument('--aco-epochs', type=int, default=25)
     p.add_argument('--ants', type=int, default=25)
@@ -571,7 +597,7 @@ def main():
     p.add_argument('--save-mp4', action='store_true')
     p.add_argument('--ffmpeg', default='ffmpeg')
     
-    p.add_argument('--internal-heatmap-epoch', type=int, default=-1, help='Epoch tk to plot internal pheromone evolution')
+    p.add_argument('--internal-heatmap-epoch', type=int, default=-1)
 
     a = p.parse_args()
     out = Path(a.output)
@@ -589,7 +615,7 @@ def main():
     station_ids = tuple(stations.keys())
     station_centers = set(stations.values())
     
-    cache = build_cache_dijkstra(graph, stations)
+    cache_dist, cache_hops = build_dual_cache(graph, stations)
     
     station_zone_nodes = set()
     for v in station_centers:
@@ -626,9 +652,75 @@ def main():
     
     time_limit = a.max_time if a.max_time > 0 else None
     
-    model = DynamicRobustACO(
+    # ATUALIZAÇÃO DO OTIMIZADOR COM NOVA PENALIDADE
+    class ResilientDynamicRobustACO(DynamicRobustACO):
+        @staticmethod
+        def evaluate(problem: ChargingAssignmentProblem, assignment: np.ndarray):
+            r = len(problem.robot_ids)
+            if assignment.shape != (r,):
+                raise ValueError("assignment has wrong shape")
+            
+            nominal = float(problem.nominal_cost[np.arange(r), assignment].sum())
+            active_dev = problem.deviation[np.arange(r), assignment]
+            robust = DynamicRobustACO._robust_term(active_dev, problem.gamma)
+            
+            new_load = np.bincount(assignment, minlength=len(problem.station_ids))
+            total_load = problem.current_load + new_load
+            
+            if np.any(total_load > problem.total_capacity):
+                return math.inf, {"nominal": nominal, "robust": robust, "congestion": math.inf, "queue": math.inf, "waiting": math.inf, "switching": math.inf}
+            
+            chargers = np.asarray(getattr(problem, "charger_capacity", problem.total_capacity), dtype=int)
+            charge_time = np.asarray(getattr(problem, "charging_time", np.ones(len(problem.station_ids))), dtype=float)
+            queue_weight = float(getattr(problem, "queue_weight", 1.0))
+            wait_weight = float(getattr(problem, "waiting_weight", 1.0))
+            current_soc = np.asarray(getattr(problem, "soc", np.ones(r)), dtype=float)
+            true_budget = getattr(problem, "true_budget", problem.travel_budget)
+            
+            queue_cost = 0.0
+            waiting_cost = 0.0
+            starvation_penalty = 0.0
+            
+            for j in range(len(problem.station_ids)):
+                members = [i for i in range(r) if int(assignment[i]) == j]
+                members.sort(key=lambda i: (float(current_soc[i]), i))
+                occupied = int(problem.current_load[j])
+                
+                for rank, i in enumerate(members, start=1):
+                    absolute_position = occupied + rank
+                    wait_cycles = max(0, (absolute_position - 1) // max(1, int(chargers[j])))
+                    wait = wait_cycles * float(charge_time[j])
+                    
+                    queue_cost += queue_weight * max(0, absolute_position - int(chargers[j]))
+                    waiting_cost += wait_weight * wait
+                    
+                    total_expected_time = problem.nominal_cost[i, j] + problem.deviation[i, j] + wait
+                    if total_expected_time > true_budget[i]:
+                        # O D-ACO não crasha. Tenta escolher o mal menor.
+                        starvation_penalty += 1000.0 * (total_expected_time - true_budget[i])
+
+            utilization = total_load / problem.total_capacity
+            congestion = float(problem.congestion_weight * np.sum(utilization ** 2))
+            
+            switching_count = 0
+            for i, rid in enumerate(problem.robot_ids):
+                previous = problem.previous_assignment.get(rid)
+                if previous is not None and previous != problem.station_ids[int(assignment[i])]:
+                    switching_count += 1
+            switching = float(problem.switching_weight * switching_count)
+            
+            total_fitness = nominal + robust + congestion + queue_cost + waiting_cost + switching + starvation_penalty
+            
+            components = {
+                "nominal": nominal, "robust": robust, "congestion": congestion,
+                "queue": float(queue_cost), "waiting": float(waiting_cost),
+                "switching": switching, "switch_count": float(switching_count), "starvation": starvation_penalty
+            }
+            return total_fitness, components
+
+    model = ResilientDynamicRobustACO(
         epoch=a.aco_epochs, pop_size=a.ants, heuristic_power=2.5,
-        evaporation=0.2, forgetting=0.15, q_pheromone=8, max_time=time_limit
+        evaporation=0.2, forgetting=0.15, q_pheromone=a.q_pheromone, max_time=time_limit
     )
     
     previous_assignment = {}
@@ -640,13 +732,16 @@ def main():
     pheromone_snapshots = {}
     internal_pheromone_snapshot = None 
     
+    ongoing_trips = {}
+    trip_records = []
+    starved_robots = set()
+    
     for k in range(a.epochs):
         
         for r in robot_ids:
             if state[r] == WORKING and vertices[r] == working_targets[r]:
                 occupied_targets = set(working_targets.values())
                 available_targets = [n for n in working_node_pool if n not in occupied_targets]
-                
                 if available_targets:
                     working_targets[r] = int(rng.choice(available_targets))
                 else:
@@ -654,16 +749,22 @@ def main():
                     
         for r in robot_ids:
             if state[r] == WORKING:
-                soc[r] -= rng.uniform(0.06, 0.12)
+                soc[r] -= rng.uniform(0.03, 0.06)
                 if soc[r] < a.battery_threshold:
                     state[r] = HEADING
             elif state[r] == HEADING:
                 soc[r] -= rng.uniform(0.010, 0.020)
                 sid = previous_assignment.get(r)
                 if sid is not None:
-                    dist = cache.get((vertices[r], sid), float('inf'))
-                    if dist <= 1.5:
+                    dist_hops = cache_hops.get((vertices[r], sid), float('inf'))
+                    if dist_hops <= 1.0:
                         state[r] = WAITING
+            elif state[r] == WAITING:
+                soc[r] -= rng.uniform(0.005, 0.010)
+            
+            if soc[r] <= 0.0:
+                starved_robots.add(r)
+                soc[r] = 0.0
 
         for sid, station_v in stations.items():
             waiting = [r for r in robot_ids if state[r] == WAITING and previous_assignment.get(r) == sid]
@@ -676,6 +777,16 @@ def main():
                 for r in waiting[:free_spots]:
                     state[r] = PLUGGED_IN
                     plugged.append(r)
+                    
+                    if r in ongoing_trips:
+                        trip = ongoing_trips.pop(r)
+                        real_time = k - trip['start_k']
+                        trip_records.append({
+                            'robot_id': r,
+                            'nominal_hops': trip['nominal_hops'],
+                            'robust_hops': trip['robust_hops'],
+                            'real_epochs': real_time
+                        })
             
             for r in plugged:
                 soc[r] = min(1.0, soc[r] + 0.15)
@@ -687,7 +798,7 @@ def main():
         load = np.zeros(a.stations, dtype=int)
         
         problem, kused = build_subset_problem(
-            model, active_rids, station_ids, vertices, cache,
+            model, active_rids, station_ids, vertices, cache_dist,
             soc, caps, load, previous_assignment, a.minimum_reachable, a.chargers_per_station,
             a.gamma_frac, a.dev_mult, a.dev_base, working_targets, a.lookahead_weight
         )
@@ -697,16 +808,34 @@ def main():
             result = model.solve(problem, seed=a.seed + k)
             previous_assignment = dict(result.assignment)
             
+            for r in active_rids:
+                if state[r] in (HEADING, WAITING):
+                    assigned_sid = previous_assignment.get(r)
+                    if assigned_sid and r not in ongoing_trips:
+                        hop_val = cache_hops.get((vertices[r], assigned_sid), float('inf'))
+                        if hop_val != float('inf'):
+                            real_nominal = max(0.0, hop_val - 1.0)
+                            robust_bound = real_nominal + (a.dev_mult * real_nominal) + a.dev_base
+                            ongoing_trips[r] = {
+                                'start_k': k,
+                                'nominal_hops': real_nominal,
+                                'robust_hops': robust_bound
+                            }
+            
             num_active = len(active_rids)
             avg_soc = np.mean(list(soc.values()))
+            min_soc = np.min(list(soc.values())) if len(soc) > 0 else 0.0 
+            
             macro_data.append({
                 'epoch': k,
                 'active_agents': num_active,
                 'avg_soc': avg_soc,
+                'min_soc': min_soc,
                 'fitness_per_agent': result.fitness / num_active if num_active else 0,
                 'robust_cost_per_agent': result.components.get('robust', 0) / num_active if num_active else 0,
                 'congestion_per_agent': result.components.get('congestion', 0) / num_active if num_active else 0,
-                'switches': result.components.get('switch_count', 0)
+                'switches': result.components.get('switch_count', 0),
+                'cumulative_starvations': len(starved_robots) 
             })
             
             if num_active > 0 and hasattr(model, 'history_iter'):
@@ -725,8 +854,8 @@ def main():
                 if state[r] in (WAITING, PLUGGED_IN):
                     new_sid = previous_assignment.get(r)
                     if new_sid:
-                        dist = cache.get((vertices[r], new_sid), float('inf'))
-                        if dist > 1.5:
+                        dist_hops = cache_hops.get((vertices[r], new_sid), float('inf'))
+                        if dist_hops > 1.0:
                             state[r] = HEADING
             
         target = {}
@@ -734,7 +863,15 @@ def main():
         dynamic_edges = set()
         
         state_priority = {PLUGGED_IN: 0, WAITING: 1, HEADING: 2, WORKING: 3}
-        prioritized_rids = sorted(robot_ids, key=lambda r: (state_priority[state[r]], r))
+        
+        def get_dist(r):
+            if state[r] in (HEADING, WAITING) and previous_assignment.get(r):
+                return cache_dist.get((vertices[r], previous_assignment.get(r)), 0)
+            elif state[r] == WORKING:
+                return cache_dist.get((vertices[r], working_targets[r]), 0)
+            return 0
+            
+        prioritized_rids = sorted(robot_ids, key=lambda r: (state_priority[state[r]], soc[r], get_dist(r)))
         
         unplanned_positions = {vertices[r] for r in robot_ids}
         
@@ -744,7 +881,7 @@ def main():
             
             nxt_step = get_next_step(
                 r, vertices[r], state, previous_assignment,
-                graph, cache, stations, rng, working_targets, pos, 
+                graph, cache_dist, stations, rng, working_targets, pos, 
                 blocked, station_centers, dynamic_edges, a.cols
             )
             
@@ -776,7 +913,7 @@ def main():
             print("\n📈 A exportar métricas e gerar gráficos académicos...")
             df_macro = pd.DataFrame(macro_data)
             df_macro.to_csv(data_dir / 'macro_metrics_evolution.csv', index=False)
-            plot_academic_results(df_macro, aco_snapshots, pheromone_snapshots, internal_pheromone_snapshot, a.internal_heatmap_epoch, out)
+            plot_academic_results(df_macro, aco_snapshots, pheromone_snapshots, internal_pheromone_snapshot, a.internal_heatmap_epoch, trip_records, out)
 
         if aco_snapshots:
             print("💾 A exportar CSV da Micro-convergência...")

@@ -20,7 +20,7 @@ import numpy as np
 try:
     from mealpy.optimizer import Optimizer as _MealpyOptimizer
     MEALPY_AVAILABLE = True
-except ImportError:  # Makes the example runnable without the optional package.
+except ImportError:
     MEALPY_AVAILABLE = False
 
     class _MealpyOptimizer:
@@ -33,17 +33,13 @@ except ImportError:  # Makes the example runnable without the optional package.
 
 @dataclass
 class ChargingAssignmentProblem:
-    """State of one supervisory decision epoch.
-
-    All values in ``nominal_cost``, ``deviation`` and ``travel_budget`` must
-    have consistent units, e.g. energy, time, or equivalent distance.
-    """
+    """State of one supervisory decision epoch."""
 
     robot_ids: Sequence[Hashable]
     station_ids: Sequence[Hashable]
     nominal_cost: np.ndarray             # shape (R, S), c_ij
     deviation: np.ndarray                # shape (R, S), d_ij
-    travel_budget: np.ndarray            # shape (R,), L_i
+    travel_budget: np.ndarray            # shape (R,), L_i (Mathematical Budget)
     residual_capacity: np.ndarray        # shape (S,), A_j
     current_load: Optional[np.ndarray] = None  # shape (S,), q_j
     total_capacity: Optional[np.ndarray] = None # shape (S,), C_j
@@ -92,15 +88,12 @@ class ChargingAssignmentProblem:
 
     @property
     def feasible_mask(self) -> np.ndarray:
-        """Arc (i,j) is safe under the local worst-case deviation."""
         return (self.nominal_cost + self.deviation <= self.travel_budget[:, None]) & \
                (self.residual_capacity[None, :] > 0)
 
 
 @dataclass
 class ACOResult:
-    """Result object with MEALPY-like ``solution`` and ``target.fitness``."""
-
     solution: np.ndarray
     fitness: float
     assignment: Dict[Hashable, Hashable]
@@ -114,8 +107,6 @@ class ACOResult:
 
 
 class DynamicRobustACO(_MealpyOptimizer):
-    """Dynamic ACO for robust, capacitated robot-to-charger assignment."""
-
     def __init__(
         self,
         epoch: int = 60,
@@ -135,14 +126,6 @@ class DynamicRobustACO(_MealpyOptimizer):
         **kwargs,
     ) -> None:
         super().__init__(name=name, **kwargs)
-        if epoch < 1 or pop_size < 2:
-            raise ValueError("epoch >= 1 and pop_size >= 2 are required")
-        if alpha < 0 or heuristic_power < 0:
-            raise ValueError("alpha and heuristic_power must be nonnegative")
-        if not 0 < evaporation <= 1 or not 0 <= forgetting <= 1:
-            raise ValueError("evaporation in (0,1], forgetting in [0,1]")
-        if not 0 < tau_min <= tau0 <= tau_max:
-            raise ValueError("Require 0 < tau_min <= tau0 <= tau_max")
         self.epoch = int(epoch)
         self.pop_size = int(pop_size)
         self.alpha = float(alpha)
@@ -172,11 +155,9 @@ class DynamicRobustACO(_MealpyOptimizer):
         self.g_best: Optional[ACOResult] = None
 
     def reset_memory(self) -> None:
-        """Forget all pheromone transferred from previous decision epochs."""
         self.pheromone.clear()
 
     def _transfer_pheromone(self, problem: ChargingAssignmentProblem) -> None:
-        """Keep valid robot-station memories and softly forget old evidence."""
         valid = set()
         mask = problem.feasible_mask
         for i, rid in enumerate(problem.robot_ids):
@@ -190,7 +171,6 @@ class DynamicRobustACO(_MealpyOptimizer):
 
     @staticmethod
     def _maximum_b_matching(problem: ChargingAssignmentProblem) -> Optional[np.ndarray]:
-        """Find one feasible unit-demand assignment by DFS over station slots."""
         mask = problem.feasible_mask
         slots: List[int] = []
         for j, cap in enumerate(problem.residual_capacity):
@@ -222,7 +202,6 @@ class DynamicRobustACO(_MealpyOptimizer):
 
     @staticmethod
     def _robust_term(active_deviations: np.ndarray, gamma: float) -> float:
-        """Bertsimas-Sim budget term using descending order statistics."""
         if gamma <= 0 or active_deviations.size == 0:
             return 0.0
         values = np.sort(np.asarray(active_deviations, dtype=float))[::-1]
@@ -238,40 +217,67 @@ class DynamicRobustACO(_MealpyOptimizer):
         r = len(problem.robot_ids)
         if assignment.shape != (r,):
             raise ValueError("assignment has wrong shape")
+        
         nominal = float(problem.nominal_cost[np.arange(r), assignment].sum())
         active_dev = problem.deviation[np.arange(r), assignment]
         robust = DynamicRobustACO._robust_term(active_dev, problem.gamma)
+        
         new_load = np.bincount(assignment, minlength=len(problem.station_ids))
         total_load = problem.current_load + new_load
         
         if np.any(total_load > problem.total_capacity):
             return math.inf, {"nominal": nominal, "robust": robust, "congestion": math.inf, "queue": math.inf, "waiting": math.inf, "switching": math.inf}
+        
         chargers = np.asarray(getattr(problem, "charger_capacity", problem.total_capacity), dtype=int)
+        
+        # AGORA LÊ O TEMPO REAL DE CARREGAMENTO (Em vez do default = 1.0)
         charge_time = np.asarray(getattr(problem, "charging_time", np.ones(len(problem.station_ids))), dtype=float)
+        
         queue_weight = float(getattr(problem, "queue_weight", 1.0))
         wait_weight = float(getattr(problem, "waiting_weight", 1.0))
         soc = np.asarray(getattr(problem, "soc", np.ones(r)), dtype=float)
+        
+        # Puxa o orçamento físico verdadeiro do robô
+        true_budget = getattr(problem, "true_budget", problem.travel_budget)
+        
         queue_cost = 0.0
         waiting_cost = 0.0
+        starvation_penalty = 0.0  # NOVO: Penalidade Letal
+        
         for j in range(len(problem.station_ids)):
             members = [i for i in range(r) if int(assignment[i]) == j]
+            # Ordena a fila: robôs com menos bateria carregam primeiro
             members.sort(key=lambda i: (float(soc[i]), i))
             occupied = int(problem.current_load[j])
+            
             for rank, i in enumerate(members, start=1):
                 absolute_position = occupied + rank
                 wait_cycles = max(0, (absolute_position - 1) // max(1, int(chargers[j])))
+                
+                # A espera reflete agora os ~5 epochs físicos necessários por robô
                 wait = wait_cycles * float(charge_time[j])
                 queue_cost += queue_weight * max(0, absolute_position - int(chargers[j]))
                 waiting_cost += wait_weight * wait
+                
+                # NOVO: HARD CONSTRAINT DE SOBREVIVÊNCIA
+                # O robô tem energia para (Viagem + Desvios + FILA)?
+                total_expected_time = problem.nominal_cost[i, j] + problem.deviation[i, j] + wait
+                if total_expected_time > true_budget[i]:
+                    # Penalidade proporcional para manter o gradiente ativo entre filas ruins
+                    starvation_penalty += 150.0 * (total_expected_time - true_budget[i])
+
         utilization = total_load / problem.total_capacity
-        # Penalização quadrática suave em vez de barreira explosiva
         congestion = float(problem.congestion_weight * np.sum(utilization ** 2))
+        
         switching_count = 0
         for i, rid in enumerate(problem.robot_ids):
             previous = problem.previous_assignment.get(rid)
             if previous is not None and previous != problem.station_ids[int(assignment[i])]:
                 switching_count += 1
         switching = float(problem.switching_weight * switching_count)
+        
+        total_fitness = nominal + robust + congestion + queue_cost + waiting_cost + switching + starvation_penalty
+        
         components = {
             "nominal": nominal,
             "robust": robust,
@@ -280,8 +286,9 @@ class DynamicRobustACO(_MealpyOptimizer):
             "waiting": float(waiting_cost),
             "switching": switching,
             "switch_count": float(switching_count),
+            "starvation": starvation_penalty
         }
-        return nominal + robust + congestion + queue_cost + waiting_cost + switching, components
+        return total_fitness, components
 
     def _construct_ant(self, problem: ChargingAssignmentProblem, rng: np.random.Generator) -> Optional[np.ndarray]:
         mask = problem.feasible_mask
@@ -303,7 +310,6 @@ class DynamicRobustACO(_MealpyOptimizer):
                 for j in candidates:
                     projected_load = problem.current_load[j] + (problem.residual_capacity[j] - remaining[j]) + 1
                     u = projected_load / problem.total_capacity[j]
-                    # Penalização quadrática suave para a heurística da formiga
                     delta_barrier = u ** 2
                     switch = float(problem.previous_assignment.get(problem.robot_ids[i]) not in (None, problem.station_ids[j]))
                     guide = problem.nominal_cost[i, j] + gamma_fraction * problem.deviation[i, j]
@@ -424,8 +430,6 @@ class DynamicRobustACO(_MealpyOptimizer):
             self.history_iter['fitness_iter'].append(float(best_fitness))
             mean_pher = float(np.mean(list(self.pheromone.values()))) if self.pheromone else 0.0
             self.history_iter['pheromone_mean'].append(mean_pher)
-            
-            # --- SALVA A MATRIZ DE FEROMONIO NESTA ITERAÇÃO ---
             self.history_iter['pheromone_matrix'].append(dict(self.pheromone))
             
             entropy, tau_ratio = self._pheromone_diagnostics(problem)
